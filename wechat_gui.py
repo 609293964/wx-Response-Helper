@@ -8,7 +8,6 @@ import datetime
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
 from PyQt5.QtGui import *
-# from ui_auto_wechat import WeChat
 from ui_auto_wechat import WeChat
 from module import *
 from wechat_locale import WeChatLocale
@@ -26,7 +25,23 @@ class WechatGUI(QWidget):
         self.config_path = "wechat_config.json"
         if os.path.exists(self.config_path):
             with open(self.config_path, "r", encoding="utf-8") as r:
-                self.config = json.load(r)
+                try:
+                    self.config = json.load(r)
+                except json.JSONDecodeError:
+                    self.config = {}
+                
+                # 优化：确保基础配置结构存在，防止旧版本升级或配置文件损坏导致缺少键值而闪退
+                if "settings" not in self.config: self.config["settings"] = {}
+                if "contacts" not in self.config: self.config["contacts"] = []
+                if "messages" not in self.config: self.config["messages"] = []
+                if "schedules" not in self.config: self.config["schedules"] = []
+                
+                # 确保关键设置有默认值
+                settings = self.config["settings"]
+                settings.setdefault("wechat_path", "")
+                settings.setdefault("send_interval", 0)
+                settings.setdefault("system_version", "new")
+                settings.setdefault("language", "zh-CN")
 
         else:
             # 默认配置
@@ -44,8 +59,8 @@ class WechatGUI(QWidget):
             self.save_config()
 
         self.wechat = WeChat(
-            path=self.config["settings"]["wechat_path"],
-            locale=self.config["settings"]["language"],
+            path=self.config["settings"].get("wechat_path", ""),
+            locale=self.config["settings"].get("language", "zh-CN"),
         )
         self.clock = ClockThread()
 
@@ -130,10 +145,6 @@ class WechatGUI(QWidget):
             if not path == "":
                 contacts = self.wechat.find_all_contacts()
                 contacts.to_csv(path, index=False, encoding='utf_8_sig')
-                # with open(path, 'w', encoding='utf-8') as f:
-                #     for contact in contacts:
-                #         f.write(contact + '\n')
-
                 QMessageBox.information(self, "保存成功", "联系人列表保存成功！")
 
         # 保存群聊列表
@@ -314,7 +325,7 @@ class WechatGUI(QWidget):
             info.setStyleSheet("color:black")
             info.setText("定时发送（目前未开始）")
 
-        # 按钮相应：开启防止自动下线。开启后每隔一小时自动点击微信窗口，防止自动下线
+        # 按钮相应：开启防止自动下线
         def prevent_offline():
             if self.clock.prevent_offline is True:
                 self.clock.prevent_offline = False
@@ -322,7 +333,6 @@ class WechatGUI(QWidget):
                 prevent_btn.setText("防止自动下线：（目前关闭）")
 
             else:
-                # 弹出提示框
                 QMessageBox.information(self, "防止自动下线", "防止自动下线已开启！每隔一小时自动点击微信窗口，防"
                                                               "止自动下线。请不要在正常使用电脑时使用该策略。")
 
@@ -334,7 +344,7 @@ class WechatGUI(QWidget):
 
         # 左边的时间列表
         self.time_view = MyListWidget()
-        # 加载配置文件里保存的用户
+        # 加载配置文件里保存的时间
         for schedule in self.config["schedules"]:
             self.time_view.addItem(schedule)
             
@@ -447,7 +457,7 @@ class WechatGUI(QWidget):
         vbox.addWidget(info)
         vbox.addWidget(add_btn)
         vbox.addWidget(del_btn)
-        # 新增：一键删除所有时间按钮
+        # 一键删除所有时间按钮
         clear_all_btn = QPushButton("清空所有定时")
         def clear_all_schedules():
             reply = QMessageBox.question(self, "确认清空", "确定要删除所有定时任务吗？", 
@@ -616,9 +626,9 @@ class WechatGUI(QWidget):
         send_btn = QPushButton("发送")
         send_btn.clicked.connect(send_msg)
 
-        # 新增：发送后自动删除文件的复选框
+        # 发送后自动删除文件的复选框
         self.auto_delete_files = QCheckBox("发送文件后自动删除源文件")
-        # 从配置中读取上次的设置，默认关闭
+        # 优化：安全读取配置
         self.auto_delete_files.setChecked(self.config["settings"].get("auto_delete_files", False))
         
         # 保存设置到配置
@@ -628,7 +638,7 @@ class WechatGUI(QWidget):
         
         self.auto_delete_files.stateChanged.connect(toggle_auto_delete)
 
-        # 新增：同步文件夹功能
+        # 同步文件夹功能
         self.sync_folder_enabled = QCheckBox("启用文件夹同步到待发送列表")
         self.sync_folder_path = QLineEdit()
         self.sync_folder_path.setPlaceholderText("选择要同步的文件夹路径")
@@ -638,7 +648,7 @@ class WechatGUI(QWidget):
         self.sync_folder_timer.setInterval(10000)  # 每10秒检查一次文件夹变化，资源占用极低
         self.sync_folder_last_mtime = 0  # 记录文件夹上次修改时间
         
-        # 从配置中读取上次的设置
+        # 优化：安全读取配置
         self.sync_folder_enabled.setChecked(self.config["settings"].get("sync_folder_enabled", False))
         self.sync_folder_path.setText(self.config["settings"].get("sync_folder_path", ""))
         
@@ -745,7 +755,8 @@ class WechatGUI(QWidget):
 
         # 发送不同用户时的间隔
         send_interval = MySpinBox("发送不同用户时的间隔（秒）")
-        send_interval.spin_box.setValue(self.config["settings"]["send_interval"])
+        # 优化：安全读取配置
+        send_interval.spin_box.setValue(self.config["settings"].get("send_interval", 0))
 
         # 添加修改间隔的响应
         def change_spin_box():
@@ -824,13 +835,13 @@ class WechatGUI(QWidget):
         lang_zh_TW_btn = QRadioButton("繁体中文")
         lang_en_btn = QRadioButton("English")
 
-        if self.config["settings"]["language"] == "zh-CN":
+        # 优化：安全读取语言配置
+        lang = self.config["settings"].get("language", "zh-CN")
+        if lang == "zh-CN":
             lang_zh_CN_btn.setChecked(True)
-
-        elif self.config["settings"]["language"] == "zh-TW":
+        elif lang == "zh-TW":
             lang_zh_TW_btn.setChecked(True)
-
-        elif self.config["settings"]["language"] == "en-US":
+        elif lang == "en-US":
             lang_en_btn.setChecked(True)
 
         # 选择按钮的响应事件
@@ -991,14 +1002,11 @@ class WechatGUI(QWidget):
                     # 添加到消息列表（通过信号切到主线程）
                     msg = f"[{current_time}] 🚨 警报: 检测到关键词 '{last_text}'"
                     self.alert_message_signal.emit(msg)
-                    # 弹出提示框 - QMessageBox::warning 会自动切到主线程执行，但为了保险也放在信号里？
-                    # 实际上 QMessageBox 即使在后台线程调用也会出问题，所以需要用信号触发
-                    # 定义 lambda 来捕获变量并弹出提示
+                    # 弹出提示框 - 使用 QTimer.singleShot 保证在主线程安全执行
                     def show_alert():
                         QMessageBox.warning(self, "关键词警报", 
                             f"检测到包含关键词的新消息！\n\n时间: {current_time}\n内容: {last_text}\n\n"
                             "请及时查看处理。")
-                    # 使用 QTimer.singleShot 在主线程执行
                     QTimer.singleShot(0, show_alert)
                 
                 # 状态记录（只用于记录解除信息，不阻塞重复警报）
@@ -1073,8 +1081,6 @@ class WechatGUI(QWidget):
         vbox.addStretch(5)
         vbox.addLayout(monitor)
         vbox.addStretch(1)
-
-        # qle.textChanged[str].connect(self.onChanged)
 
         #获取显示器分辨率
         desktop = QApplication.desktop()
