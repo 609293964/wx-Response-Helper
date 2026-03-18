@@ -72,9 +72,8 @@ class MomoReplyGUI(QWidget):
                 images.append(os.path.join(folder, file))
         return images
 
-    # 优化点1：彻底安全的退出事件，防止后台倒计时线程在软件关闭后继续作妖
     def closeEvent(self, event):
-        self.monitoring = False  # 强制切断所有延迟发送线程的执行条件
+        self.monitoring = False
         self.last_triggered = False
         
         if hasattr(self, 'wechat') and hasattr(self.wechat, 'stop_last_message_monitor'):
@@ -93,8 +92,8 @@ class MomoReplyGUI(QWidget):
         msg_box.setInformativeText(
             "由于微信版本更新，我们现在使用微信内置的快捷键来打开/隐藏微信窗口，请确保你的微信打开快捷键为Ctrl+Alt+w。具体查看方式为“设置”->“快捷键”->“显示/隐藏窗口”\n\n"
             "⚠️ 使用说明：\n"
-            "• 请打开并保持与momo的聊天窗口在前台\n"
-            "• 当momo发送包含感叹号的消息时，自动随机回复素材文件夹中的一张图片\n"
+            "• 请打开并保持与指定联系人的聊天窗口在前台\n"
+            "• 当对方发送满足【触发关键词】条件的消息时，自动随机回复素材文件夹中的一张图片\n"
             "• 图片发送后会自动从素材文件夹中删除，避免重复发送\n\n"
         )
         msg_box.setStandardButtons(QMessageBox.Ok)
@@ -226,8 +225,11 @@ class MomoReplyGUI(QWidget):
         form_layout.addRow("", random_hint)
         
         form_layout.addRow(QLabel("------------------------"))
-        self.trigger_mode_exact = QRadioButton("只匹配单独感叹号（例如 \"!\" 或 \"！\"）")
-        self.trigger_mode_contains = QRadioButton("只要包含感叹号就触发")
+        
+        # 【修改点1】：将界面文案修改为泛用型的“触发关键词”
+        self.trigger_mode_exact = QRadioButton("完全匹配单独的触发关键词")
+        self.trigger_mode_contains = QRadioButton("只要包含触发关键词就触发")
+        
         if settings_config.get("trigger_mode", "exact") == "exact":
             self.trigger_mode_exact.setChecked(True)
         else:
@@ -345,7 +347,8 @@ class MomoReplyGUI(QWidget):
         
         if triggered and not self.last_triggered:
             self.last_triggered = True
-            self.add_log(f"🚨🚨🚨 【高危警报】检测到未回复的感叹号！抓取内容: '{last_text}'")
+            # 【修改点2】：将日志警告中的感叹号替换为泛用名称
+            self.add_log(f"🚨🚨🚨 【高危警报】检测到触发关键词！抓取内容: '{last_text}'")
             
             base_delay = settings_config.get("send_delay", 0)
             random_range = settings_config.get("random_delay", 0)
@@ -359,7 +362,6 @@ class MomoReplyGUI(QWidget):
                 def delayed_send():
                     wait_time = delay_seconds
                     while wait_time > 0:
-                        # 优化点2：极其严格的监控中断检测，随时中止倒计时
                         if not getattr(self, 'monitoring', False):
                             self.add_log("⏹️ 监控已停止，取消本次延迟发送计划")
                             self.last_triggered = False
@@ -397,8 +399,6 @@ class MomoReplyGUI(QWidget):
             self.wechat.send_file(trigger_sender, selected_image, search_user=False)
             self.add_log(f"📤 图片操作发送完毕")
             
-            # 优化点3：增加短暂停留和文件占用捕获。由于微信是异步发图（把图塞进剪贴板后按下回车）
-            # 直接秒删图片有时会导致微信发出一张“裂开”的图或者让微信崩溃。
             time.sleep(1.0) 
             try:
                 os.remove(selected_image)
@@ -500,7 +500,6 @@ class MomoReplyGUI(QWidget):
 
         self.setLayout(vbox)
         
-        # 优化点4：替换了被弃用的 QApplication.desktop()，避免在部分新系统环境下报错
         screen_rect = QApplication.primaryScreen().geometry()
         self.setFixedSize(int(screen_rect.width() * 0.5), int(screen_rect.height() * 0.7))
         self.setWindowTitle('Momo自动回复 - 专属定制版')
