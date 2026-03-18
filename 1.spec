@@ -10,7 +10,7 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['torch', 'torchvision', 'torchaudio', 'scipy', 'matplotlib', 'tkinter', 'jupyter', 'fsspec', 'jinja2', 'urllib3', 'certifi', 'charset_normalizer', 'cv2', 'pytest'],
+    excludes=[],
     noarchive=False,
     optimize=0,
 )
@@ -22,7 +22,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='wechat_gui_momo',
+    name='1',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

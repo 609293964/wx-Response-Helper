@@ -5,6 +5,7 @@ import random
 import json
 import datetime
 import threading
+import winsound 
 
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import *
@@ -20,6 +21,7 @@ class MomoReplyGUI(QWidget):
         super().__init__()
 
         self.config_path = "wechat_config_momo.json"
+        self.log_file_path = "Momo运行日志.txt"
         
         if os.path.exists(self.config_path):
             with open(self.config_path, "r", encoding="utf-8") as r:
@@ -27,24 +29,37 @@ class MomoReplyGUI(QWidget):
                 if "settings" not in self.config:
                     self.config["settings"] = {}
         else:
-            self.config = {"settings": {"language": "zh-CN", "trigger_sender": "momo", "rules": []}}
+            self.config = {"settings": {"language": "zh-CN", "trigger_sender": "momo", "rules": [], "rule_count": 1}}
 
-        # 配置文件兼容与升级逻辑：处理老数据、补齐默认项
+        # 配置文件兼容与升级逻辑
         settings = self.config["settings"]
         
-        # 【新增】：如果微信路径为空，则自动赋上默认路径
         if not settings.get("wechat_path"):
             settings["wechat_path"] = r"C:\Program Files\Tencent\Weixin.exe"
             
         old_kw = settings.pop("trigger_keywords", None)
         old_folder = settings.pop("material_folder", None)
+        old_global_match = settings.pop("trigger_mode", "contains")
+        
         if "rules" not in settings:
             settings["rules"] = []
             if old_kw or old_folder:
-                settings["rules"].append({"keywords": old_kw or "", "type": "image", "content": old_folder or ""})
+                settings["rules"].append({
+                    "keywords": old_kw or "", 
+                    "match": old_global_match, 
+                    "type": "image", 
+                    "content": old_folder or ""
+                })
         
         while len(settings["rules"]) < 5:
-            settings["rules"].append({"keywords": "", "type": "text", "content": ""})
+            settings["rules"].append({"keywords": "", "match": "contains", "type": "text", "content": ""})
+            
+        for rule in settings["rules"]:
+            if "match" not in rule:
+                rule["match"] = "contains"
+                
+        if "rule_count" not in settings:
+            settings["rule_count"] = 1
             
         self.save_config()
 
@@ -63,8 +78,8 @@ class MomoReplyGUI(QWidget):
         if self.config.get("settings", {}).get("enable_auto_timer", False):
             self.enable_auto_timer.setChecked(True)
             self.start_auto_timer_check()
-        
-        self.show_wechat_open_notice()
+            
+        self.add_log("🚀 欢迎使用多规则自动回复助手！")
 
     def save_config(self):
         with open(self.config_path, "w", encoding="utf8") as w:
@@ -91,14 +106,62 @@ class MomoReplyGUI(QWidget):
         msg_box.setWindowTitle("重要提示")
         msg_box.setText("新版多规则自动回复")
         msg_box.setInformativeText(
-            "⚠️ 使用说明：\n"
-            "• 现在支持配置多达5组完全不同的触发规则！\n"
-            "• 每组可独立设置【关键词】，并自由选择是【回复文本】还是【发随机图】。\n"
-            "• 从上到下优先级依次降低（即匹配到规则1就不会再触发规则2）。\n"
-            "• 不想用的规则，保持关键词为空即可禁用。\n"
+            "⚠️ 进阶功能说明：\n"
+            "• 【独立匹配模式】：现在每条规则都可以单独设置是“精确匹配”还是“包含匹配”了！\n"
+            "• 【自动记录日志】：所有的触发和发送记录都会永久保存在软件目录下的 Momo运行日志.txt 中。\n"
+            "• 【一键重启唤醒】：如果发现抓不到消息，点击[一键重启并唤醒微信]按钮，软件会自动：关掉当前微信 -> 开讲述人 -> 重新开微信 -> 关讲述人。完美避开微信的检测盲区！\n"
         )
         msg_box.setStandardButtons(QMessageBox.Ok)
         msg_box.exec_()
+
+    # --- 修正版：彻底关闭微信 -> 开讲述人 -> 开微信 -> 关讲述人 ---
+    def auto_wake_wechat(self):
+        # 防误触二次确认
+        reply = QMessageBox.question(self, '确认重启微信',
+                                     "此操作将强制关闭您当前正在运行的微信，\n并在后台开启无障碍环境后重新启动它。\n\n重启后您可能需要重新点击登录。\n是否继续执行？",
+                                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply == QMessageBox.No:
+            return
+
+        self.add_log("🛠️ 开始执行一键重启并唤醒微信流程...")
+        self.wake_btn.setEnabled(False)
+        self.wake_btn.setText("唤醒中...")
+        
+        def task():
+            try:
+                # 1. 彻底杀掉微信进程
+                self.add_log("🛑 正在强制关闭微信...")
+                os.system("taskkill /F /IM WeChat.exe >nul 2>&1")
+                time.sleep(2.0)
+                
+                # 2. 启动讲述人
+                self.add_log("👁️ 正在开启 Windows 讲述人...")
+                os.system("start narrator")
+                time.sleep(3.0) # 等待讲述人完全就绪
+                
+                # 3. 启动微信
+                wechat_path = self.config.get("settings", {}).get("wechat_path", "")
+                if wechat_path and os.path.exists(wechat_path):
+                    self.add_log("🚀 正在以无障碍环境重新启动微信...")
+                    import subprocess
+                    subprocess.Popen(wechat_path)
+                    time.sleep(6.0) # 给微信充足的启动和加载时间
+                else:
+                    self.add_log("❌ 唤醒失败：微信exe路径配置不正确！")
+                    
+                # 4. 关闭讲述人
+                self.add_log("🤫 微信已重新调起，正在关闭讲述人...")
+                os.system("taskkill /F /IM narrator.exe >nul 2>&1")
+                
+                self.add_log("✅ 唤醒全流程结束！请您登录微信并打开目标聊天窗口后，再点击[开始监控]。")
+                
+            except Exception as e:
+                self.add_log(f"❌ 唤醒过程出错: {e}")
+            finally:
+                QMetaObject.invokeMethod(self.wake_btn, "setEnabled", Qt.QueuedConnection, Q_ARG(bool, True))
+                QMetaObject.invokeMethod(self.wake_btn, "setText", Qt.QueuedConnection, Q_ARG(str, "🛠️ 一键重启并唤醒微信"))
+                
+        threading.Thread(target=task, daemon=True).start()
 
     def init_language_choose(self):
         def switch_language():
@@ -132,11 +195,8 @@ class MomoReplyGUI(QWidget):
         settings_config = self.config.get("settings", {})
         form_layout = QFormLayout()
 
-        # ------------------ 微信路径设置区 ------------------
         wechat_path_input = QLineEdit()
         wechat_path_input.setText(settings_config.get("wechat_path", r"C:\Program Files\Tencent\Weixin.exe"))
-        
-        # 【新增】：支持用户直接通过键盘输入或粘贴路径，失去焦点后自动保存
         wechat_path_input.editingFinished.connect(
             lambda: self.config["settings"].update({"wechat_path": wechat_path_input.text().strip()}) or self.save_config()
         )
@@ -162,30 +222,47 @@ class MomoReplyGUI(QWidget):
         )
         form_layout.addRow("触发者昵称:", trigger_sender_input)
 
-        # ------------------ 5组自定义规则区域 ------------------
-        rules_group = QGroupBox("自定义多条触发规则 (留空代表禁用该组，优先级按顺序递减)")
-        grid = QGridLayout()
-        grid.addWidget(QLabel("触发关键词(多个词用英文逗号,分隔)"), 0, 0)
-        grid.addWidget(QLabel("回复方式"), 0, 1)
-        grid.addWidget(QLabel("回复内容 (填写文本 / 或素材文件夹路径)"), 0, 2)
+        rules_group = QGroupBox("触发规则设置 (从上到下优先级递减)")
+        rules_vbox = QVBoxLayout()
         
-        self.rule_widgets = []
+        count_hbox = QHBoxLayout()
+        count_hbox.addWidget(QLabel("启用规则数量:"))
+        self.rule_count_cb = QComboBox()
+        self.rule_count_cb.addItems(["1 组", "2 组", "3 组", "4 组", "5 组"])
+        current_count = settings_config.get("rule_count", 1)
+        self.rule_count_cb.setCurrentIndex(current_count - 1)
+        count_hbox.addWidget(self.rule_count_cb)
+        count_hbox.addStretch(1)
+        rules_vbox.addLayout(count_hbox)
+
+        grid = QGridLayout()
+        grid.addWidget(QLabel("触发关键词(逗号分隔)"), 0, 0)
+        grid.addWidget(QLabel("匹配模式"), 0, 1)    
+        grid.addWidget(QLabel("回复方式"), 0, 2)
+        grid.addWidget(QLabel("回复内容 (文本/文件夹)"), 0, 3)
+        
+        grid.setColumnStretch(0, 3)
+        grid.setColumnStretch(1, 2)
+        grid.setColumnStretch(2, 2)
+        grid.setColumnStretch(3, 4)
+        
+        self.rule_rows_ui = [] 
+        
         for i in range(5):
             rule = settings_config["rules"][i]
             
-            # 关键词输入
             kw_inp = QLineEdit(rule.get("keywords", ""))
             kw_inp.setPlaceholderText(f"规则 {i+1} 关键词")
             
-            # 回复类型下拉
+            match_cb = QComboBox()
+            match_cb.addItems(["包含匹配", "精确匹配"])
+            match_cb.setCurrentIndex(0 if rule.get("match", "contains") == "contains" else 1)
+            
             type_cb = QComboBox()
             type_cb.addItems(["回复固定文本", "回复随机图片"])
             type_cb.setCurrentIndex(0 if rule.get("type", "text") == "text" else 1)
             
-            # 回复内容输入
             content_inp = QLineEdit(rule.get("content", ""))
-            
-            # 浏览文件夹按钮 (只有在选图片时才显示)
             browse_btn = QPushButton("📁")
             browse_btn.setFixedWidth(30)
             browse_btn.setVisible(type_cb.currentIndex() == 1)
@@ -194,18 +271,20 @@ class MomoReplyGUI(QWidget):
             content_layout.setContentsMargins(0, 0, 0, 0)
             content_layout.addWidget(content_inp)
             content_layout.addWidget(browse_btn)
-            
             content_widget = QWidget()
             content_widget.setLayout(content_layout)
             
             grid.addWidget(kw_inp, i+1, 0)
-            grid.addWidget(type_cb, i+1, 1)
-            grid.addWidget(content_widget, i+1, 2)
+            grid.addWidget(match_cb, i+1, 1)
+            grid.addWidget(type_cb, i+1, 2)
+            grid.addWidget(content_widget, i+1, 3)
             
-            # 闭包绑定事件，自动保存
-            def bind_events(idx, k_w, t_w, c_w, b_w):
+            self.rule_rows_ui.append((kw_inp, match_cb, type_cb, content_widget))
+            
+            def bind_events(idx, k_w, m_w, t_w, c_w, b_w):
                 def update_cfg():
                     self.config["settings"]["rules"][idx]["keywords"] = k_w.text().strip()
+                    self.config["settings"]["rules"][idx]["match"] = "contains" if m_w.currentIndex() == 0 else "exact"
                     self.config["settings"]["rules"][idx]["type"] = "text" if t_w.currentIndex() == 0 else "image"
                     self.config["settings"]["rules"][idx]["content"] = c_w.text().strip()
                     b_w.setVisible(t_w.currentIndex() == 1)
@@ -213,6 +292,7 @@ class MomoReplyGUI(QWidget):
                     
                 k_w.editingFinished.connect(update_cfg)
                 c_w.editingFinished.connect(update_cfg)
+                m_w.currentIndexChanged.connect(update_cfg)
                 t_w.currentIndexChanged.connect(update_cfg)
                 
                 def browse():
@@ -222,13 +302,26 @@ class MomoReplyGUI(QWidget):
                         update_cfg()
                 b_w.clicked.connect(browse)
                 
-            bind_events(i, kw_inp, type_cb, content_inp, browse_btn)
-            self.rule_widgets.append((kw_inp, type_cb, content_inp))
+            bind_events(i, kw_inp, match_cb, type_cb, content_inp, browse_btn)
             
-        rules_group.setLayout(grid)
+        rules_vbox.addLayout(grid)
+        rules_group.setLayout(rules_vbox)
         form_layout.addRow(rules_group)
         
-        # ------------------ 延迟与其他设置 ------------------
+        def on_rule_count_changed(idx):
+            count = idx + 1
+            self.config["settings"]["rule_count"] = count
+            self.save_config()
+            for i, (w1, w2, w3, w4) in enumerate(self.rule_rows_ui):
+                is_visible = i < count
+                w1.setVisible(is_visible)
+                w2.setVisible(is_visible)
+                w3.setVisible(is_visible)
+                w4.setVisible(is_visible)
+                
+        self.rule_count_cb.currentIndexChanged.connect(on_rule_count_changed)
+        on_rule_count_changed(self.rule_count_cb.currentIndex()) 
+        
         delay_hbox = QHBoxLayout()
         self.delay_spin = QDoubleSpinBox()
         self.delay_spin.setRange(0, 60)
@@ -248,24 +341,72 @@ class MomoReplyGUI(QWidget):
         delay_hbox.addStretch(1)
         form_layout.addRow(delay_hbox)
         
-        mode_hbox = QHBoxLayout()
-        self.trigger_mode_exact = QRadioButton("完全匹配单独的触发关键词")
-        self.trigger_mode_contains = QRadioButton("只要包含触发关键词就触发")
-        if settings_config.get("trigger_mode", "exact") == "exact":
-            self.trigger_mode_exact.setChecked(True)
-        else:
-            self.trigger_mode_contains.setChecked(True)
-            
-        def update_trigger_mode():
-            self.config["settings"]["trigger_mode"] = "exact" if self.trigger_mode_exact.isChecked() else "contains"
+        self.enable_sound_cb = QCheckBox("触发时播放系统提示音 (防漏接)")
+        self.enable_sound_cb.setChecked(settings_config.get("enable_sound", True))
+        self.enable_sound_cb.stateChanged.connect(
+            lambda state: self.config["settings"].update({"enable_sound": state == Qt.Checked}) or self.save_config()
+        )
+        form_layout.addRow("", self.enable_sound_cb)
+        
+        form_layout.addRow(QLabel("------------------------"))
+        
+        start_hbox = QHBoxLayout()
+        self.start_hour = QSpinBox()
+        self.start_hour.setRange(0, 23)
+        self.start_hour.setValue(settings_config.get("auto_start_hour", 10))
+        self.start_minute = QSpinBox()
+        self.start_minute.setRange(0, 59)
+        self.start_minute.setValue(settings_config.get("auto_start_minute", 0))
+        
+        def update_start_time():
+            self.config["settings"].update({"auto_start_hour": self.start_hour.value(), "auto_start_minute": self.start_minute.value()})
             self.save_config()
             
-        self.trigger_mode_exact.clicked.connect(update_trigger_mode)
-        self.trigger_mode_contains.clicked.connect(update_trigger_mode)
-        mode_hbox.addWidget(self.trigger_mode_exact)
-        mode_hbox.addWidget(self.trigger_mode_contains)
-        mode_hbox.addStretch(1)
-        form_layout.addRow(mode_hbox)
+        self.start_hour.valueChanged.connect(update_start_time)
+        self.start_minute.valueChanged.connect(update_start_time)
+        start_hbox.addWidget(QLabel("每日开始:"))
+        start_hbox.addWidget(self.start_hour)
+        start_hbox.addWidget(QLabel("时"))
+        start_hbox.addWidget(self.start_minute)
+        start_hbox.addWidget(QLabel("分"))
+        start_hbox.addStretch(1)
+        form_layout.addRow(start_hbox)
+        
+        end_hbox = QHBoxLayout()
+        self.end_hour = QSpinBox()
+        self.end_hour.setRange(0, 23)
+        self.end_hour.setValue(settings_config.get("auto_end_hour", 12))
+        self.end_minute = QSpinBox()
+        self.end_minute.setRange(0, 59)
+        self.end_minute.setValue(settings_config.get("auto_end_minute", 0))
+        
+        def update_end_time():
+            self.config["settings"].update({"auto_end_hour": self.end_hour.value(), "auto_end_minute": self.end_minute.value()})
+            self.save_config()
+            
+        self.end_hour.valueChanged.connect(update_end_time)
+        self.end_minute.valueChanged.connect(update_end_time)
+        end_hbox.addWidget(QLabel("每日结束:"))
+        end_hbox.addWidget(self.end_hour)
+        end_hbox.addWidget(QLabel("时"))
+        end_hbox.addWidget(self.end_minute)
+        end_hbox.addWidget(QLabel("分"))
+        end_hbox.addStretch(1)
+        form_layout.addRow(end_hbox)
+        
+        self.enable_auto_timer = QCheckBox("启用每日定时自动启停")
+        self.enable_auto_timer.setChecked(settings_config.get("enable_auto_timer", False))
+        
+        def toggle_auto_timer(state):
+            self.config["settings"]["enable_auto_timer"] = (state == Qt.Checked)
+            self.save_config()
+            if state == Qt.Checked:
+                self.start_auto_timer_check()
+            else:
+                self.stop_auto_timer_check()
+                
+        self.enable_auto_timer.stateChanged.connect(toggle_auto_timer)
+        form_layout.addRow("", self.enable_auto_timer)
 
         return form_layout
 
@@ -273,7 +414,7 @@ class MomoReplyGUI(QWidget):
         vbox = QVBoxLayout()
         self.log_view = QListWidget()
         self.log_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        vbox.addWidget(QLabel("监控日志"))
+        vbox.addWidget(QLabel("监控日志 (已开启自动保存到文件)"))
         vbox.addWidget(self.log_view)
         return vbox
 
@@ -282,38 +423,46 @@ class MomoReplyGUI(QWidget):
 
     def _do_add_log(self, message):
         current_time = time.strftime("%H:%M:%S")
-        self.log_view.addItem(f"[{current_time}] {message}")
+        full_message = f"[{current_time}] {message}"
+        
+        self.log_view.addItem(full_message)
         self.log_view.scrollToBottom()
         if self.log_view.count() > 200:
             self.log_view.takeItem(0)
+            
+        try:
+            with open(self.log_file_path, "a", encoding="utf-8") as f:
+                f.write(f"[{time.strftime('%Y-%m-%d')}] {full_message}\n")
+        except Exception:
+            pass
 
-    # 消息触发引擎
     def on_last_message_change(self, last_text, current_time):
         settings_config = self.config.get("settings", {})
-        trigger_sender = settings_config.get("trigger_sender", "momo") # 这里做容错保留
-        trigger_mode = settings_config.get("trigger_mode", "exact")
+        trigger_sender = settings_config.get("trigger_sender", "momo") 
         rules = settings_config.get("rules", [])
+        rule_count = settings_config.get("rule_count", 1) 
         
         clean_text = str(last_text).strip()
         matched_rule = None
         matched_index = -1
         
-        # 按优先级遍历5组规则
-        for idx, rule in enumerate(rules):
+        for idx in range(rule_count):
+            rule = rules[idx]
             kw_str = rule.get("keywords", "").strip()
             content = rule.get("content", "").strip()
+            rule_match_mode = rule.get("match", "contains") 
             
             if not kw_str or not content:
                 continue
                 
             keywords = [k.strip() for k in kw_str.split(',') if k.strip()]
             for keyword in keywords:
-                if trigger_mode == "exact":
+                if rule_match_mode == "exact":
                     if clean_text == keyword:
                         matched_rule = rule
                         matched_index = idx + 1
                         break
-                else:
+                else: 
                     if keyword in clean_text:
                         matched_rule = rule
                         matched_index = idx + 1
@@ -324,6 +473,12 @@ class MomoReplyGUI(QWidget):
         if matched_rule and not self.last_triggered:
             self.last_triggered = True
             self.add_log(f"🚨 触发【规则{matched_index}】! 抓取内容: '{last_text}'")
+            
+            if settings_config.get("enable_sound", True):
+                try:
+                    winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+                except:
+                    pass
             
             base_delay = settings_config.get("send_delay", 0)
             random_range = settings_config.get("random_delay", 0)
@@ -355,7 +510,6 @@ class MomoReplyGUI(QWidget):
             self.last_triggered = False
             self.add_log(f"✅ 状态重置：对方最新消息变成了: '{last_text}'")
     
-    # 根据规则执行具体发送动作（发文本 or 发图）
     def _do_send_action(self, trigger_sender, rule):
         if not self.monitoring:
             return
@@ -397,15 +551,18 @@ class MomoReplyGUI(QWidget):
     def start_monitoring(self):
         if self.monitoring: return
         
-        rules = self.config.get("settings", {}).get("rules", [])
-        valid_count = sum(1 for r in rules if r.get("keywords") and r.get("content"))
+        settings = self.config.get("settings", {})
+        rules = settings.get("rules", [])
+        rule_count = settings.get("rule_count", 1)
+        
+        valid_count = sum(1 for i in range(rule_count) if rules[i].get("keywords") and rules[i].get("content"))
         if valid_count == 0:
-            QMessageBox.warning(self, "错误", "没有设置任何有效规则！请确保至少有一组填写了关键词和回复内容。")
+            QMessageBox.warning(self, "错误", "在当前启用的规则中，没有检测到有效配置！请确保至少有一组填写了关键词和回复内容。")
             return
         
         self.monitoring = True
         self.last_triggered = False
-        self.add_log(f"🚀 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动精准监控 (生效 {valid_count} 组规则)")
+        self.add_log(f"🚀 [{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动精准监控 (共检测到 {valid_count} 组有效规则)")
         self.wechat.start_last_message_monitor(callback=self.on_last_message_change, check_interval=1)
         
         self.start_btn.setEnabled(False)
@@ -424,27 +581,47 @@ class MomoReplyGUI(QWidget):
             self.start_btn.setStyleSheet("color:green; font-size: 14px; padding: 10px;")
             self.stop_btn.setStyleSheet("color:gray; padding: 10px;")
     
-    # ----- 定时启停模块 -----
     def start_auto_timer_check(self):
         if self.auto_timer is None:
             self.auto_timer = QTimer(self)
             self.auto_timer.timeout.connect(self.auto_check_time)
             self.auto_timer.start(60000)
+            self.add_log("⏰ 定时自动启停检查已开启")
     
     def stop_auto_timer_check(self):
         if self.auto_timer is not None:
             self.auto_timer.stop()
             self.auto_timer = None
+            self.add_log("⏹️ 定时自动启停检查已关闭")
     
     def auto_check_time(self):
-        # 兼容保留原有的自动启停逻辑
-        pass 
+        now = datetime.datetime.now()
+        settings = self.config.get("settings", {})
+        
+        current_total = now.hour * 60 + now.minute
+        start_total = settings.get("auto_start_hour", 10) * 60 + settings.get("auto_start_minute", 0)
+        end_total = settings.get("auto_end_hour", 12) * 60 + settings.get("auto_end_minute", 0)
+        
+        should_be_monitoring = start_total <= current_total < end_total
+        
+        if should_be_monitoring and not self.monitoring:
+            self.add_log(f"🤖 到达设定开始时间 {settings.get('auto_start_hour', 10):02d}:{settings.get('auto_start_minute', 0):02d}，自动启动监控")
+            self.start_monitoring()
+        elif not should_be_monitoring and self.monitoring:
+            self.add_log(f"🤖 到达设定结束时间 {settings.get('auto_end_hour', 12):02d}:{settings.get('auto_end_minute', 0):02d}，自动停止监控")
+            self.stop_monitoring()
         
     def initUI(self):
         vbox = QVBoxLayout()
         
         header_hbox = QHBoxLayout()
         header_hbox.addLayout(self.init_language_choose())
+        
+        # 修正的唤醒按钮
+        self.wake_btn = QPushButton("🛠️ 一键重启并唤醒微信", self)
+        self.wake_btn.setStyleSheet("background-color: #FFFACD; padding: 5px;")
+        self.wake_btn.clicked.connect(self.auto_wake_wechat)
+        header_hbox.addWidget(self.wake_btn)
         
         self.wechat_notice_btn = QPushButton("查看说明", self)
         self.wechat_notice_btn.clicked.connect(self.show_wechat_open_notice)
@@ -470,7 +647,7 @@ class MomoReplyGUI(QWidget):
 
         self.setLayout(vbox)
         screen_rect = QApplication.primaryScreen().geometry()
-        self.setFixedSize(int(screen_rect.width() * 0.50), int(screen_rect.height() * 0.80))
+        self.setFixedSize(int(screen_rect.width() * 0.55), int(screen_rect.height() * 0.90))
         self.setWindowTitle('多规则自动回复助手')
         self.show()
 
