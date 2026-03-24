@@ -155,17 +155,24 @@ class WeChat:
                 time.sleep(0.2)
                 
                 edit_input = chat_win.EditControl(Name="输入")
-                if edit_input.Exists(0.5, 0):
-                    move(edit_input)
-                    click(edit_input)
-                    time.sleep(0.2)
-                else:
-                    rect = chat_win.BoundingRectangle
-                    if rect:
-                        click_x = rect.left + (rect.right - rect.left) // 2
-                        click_y = rect.bottom - 60
-                        pyautogui.click(click_x, click_y)
+                
+                # 记住当前鼠标位置，防止乱跳
+                current_mouse_pos = auto.GetCursorPos()
+                try:
+                    if edit_input.Exists(0.5, 0):
+                        move(edit_input)
+                        click(edit_input)
                         time.sleep(0.2)
+                    else:
+                        rect = chat_win.BoundingRectangle
+                        if rect:
+                            click_x = rect.left + (rect.right - rect.left) // 2
+                            click_y = rect.bottom - 60
+                            pyautogui.click(click_x, click_y)
+                            time.sleep(0.2)
+                finally:
+                    # 恢复鼠标位置
+                    auto.SetCursorPos(current_mouse_pos[0], current_mouse_pos[1])
             else:
                 print(f"发送失败：找不到名为 '{name}' 的独立窗口。请确认窗口是否已拖出！")
                 return False
@@ -195,17 +202,24 @@ class WeChat:
                 time.sleep(0.2)
                 
                 edit_input = chat_win.EditControl(Name="输入")
-                if edit_input.Exists(0.5, 0):
-                    move(edit_input)
-                    click(edit_input)
-                    time.sleep(0.2)
-                else:
-                    rect = chat_win.BoundingRectangle
-                    if rect:
-                        click_x = rect.left + (rect.right - rect.left) // 2
-                        click_y = rect.bottom - 60
-                        pyautogui.click(click_x, click_y)
+                
+                # 记住当前鼠标位置，防止乱跳
+                current_mouse_pos = auto.GetCursorPos()
+                try:
+                    if edit_input.Exists(0.5, 0):
+                        move(edit_input)
+                        click(edit_input)
                         time.sleep(0.2)
+                    else:
+                        rect = chat_win.BoundingRectangle
+                        if rect:
+                            click_x = rect.left + (rect.right - rect.left) // 2
+                            click_y = rect.bottom - 60
+                            pyautogui.click(click_x, click_y)
+                            time.sleep(0.2)
+                finally:
+                    # 恢复鼠标位置
+                    auto.SetCursorPos(current_mouse_pos[0], current_mouse_pos[1])
             else:
                 print(f"发送失败：找不到名为 '{name}' 的独立窗口。请确认窗口是否已拖出！")
                 return
@@ -264,18 +278,51 @@ class WeChat:
                     
                     items = msg_list.GetChildren()
                     if items:
-                        last_item = items[-1]
-                        last_text = last_item.Name
+                        last_text = ""
+                        # 倒序遍历，跳过空白占位符、时间戳或格式异常的节点，找到真正的最后一条消息
+                        for i in range(len(items)-1, -1, -1):
+                            item = items[i]
+                            text = item.Name
+                            # 尝试对结构解析优化：如果Name为空，但内部有TextControl，尝试获取TextControl的内容
+                            if not text or len(text.strip()) == 0:
+                                try:
+                                    texts = item.GetChildren()
+                                    for t in texts:
+                                        if getattr(t, 'ControlTypeName', '') == 'TextControl' and t.Name:
+                                            text = t.Name
+                                            break
+                                except:
+                                    pass
+                            
+                            if not text or not str(text).strip():
+                                continue
+                            
+                            text = str(text).strip()
+                            
+                            # 跳过时间戳类型的项（如 "19:12", "12:30", "昨天 12:30" 等）
+                            # 微信消息列表中时间标签和消息混在一起，必须过滤
+                            if re.match(r'^(\d{1,2}:\d{2})$', text):
+                                continue
+                            if re.match(r'^(昨天|前天|星期.)\s+\d{1,2}:\d{2}$', text):
+                                continue
+                            if re.match(r'^\d{4}年\d{1,2}月\d{1,2}日\s+\d{1,2}:\d{2}$', text):
+                                continue
+                            
+                            last_text = text
+                            break
                         
                         if last_text and last_text != self.last_captured_text:
                             self.last_captured_text = last_text
                             current_time = time.strftime("%H:%M:%S")
+                            print(f"[监控日志] 捕获到消息: {last_text}")
                             if self.last_message_callback:
                                 try:
                                     self.last_message_callback(last_text, current_time)
                                 except Exception as e:
-                                    pass
+                                    print(f"执行回调报错: {e}")
                 except Exception as e:
+                    # 获取频繁时避免打印太多，实际可记录下来
+                    # print(f"监控抓取异常: {e}")
                     pass
                 
                 time.sleep(check_interval)
