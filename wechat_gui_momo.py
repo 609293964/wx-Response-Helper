@@ -1,8 +1,10 @@
 import datetime
+import ctypes
 import json
 import os
 import random
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -537,6 +539,7 @@ class MomoReplyGUI(QWidget):
         layout.setSpacing(8)
         rows = [
             ("monitor", "监控状态", "未启动"),
+            ("narrator", "讲述人", "未检查"),
             ("target", "目标窗口", "未检查"),
             ("last_message", "最后消息", "-"),
             ("last_trigger", "最近触发", "-"),
@@ -648,6 +651,7 @@ class MomoReplyGUI(QWidget):
 
     def refresh_runtime_status(self):
         self.set_status("monitor", "运行中" if self.monitoring else "未启动")
+        self.set_status("narrator", self.get_narrator_status_text())
         target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
         result = self.wechat.check_target_window(target_name)
         self.set_status("target", result.message)
@@ -670,6 +674,7 @@ class MomoReplyGUI(QWidget):
             except Exception as exc:
                 self.add_log(f"依赖异常: {name} - {exc}")
 
+        self.add_log(f"Windows 讲述人状态: {self.get_narrator_status_text()}")
         self.add_log("请确认 Windows 讲述人模式已开启，否则微信控件可能无法识别")
         target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
         target_result = self.wechat.check_target_window(target_name)
@@ -971,6 +976,209 @@ class MomoReplyGUI(QWidget):
             self.add_log("离开设定区间，自动停止监控")
             self.stop_monitoring()
 
+    def _get_windows_system_tool(self, exe_name):
+        system_root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
+        candidates = [
+            Path(system_root) / "Sysnative" / exe_name,
+            Path(system_root) / "System32" / exe_name,
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return exe_name
+
+    def _run_hidden_command(self, args, timeout=10):
+        kwargs = {
+            "capture_output": True,
+            "text": True,
+            "timeout": timeout,
+        }
+        if os.name == "nt":
+            kwargs.update(
+                {
+                    "encoding": "mbcs",
+                    "errors": "replace",
+                    "creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                }
+            )
+        return subprocess.run(args, **kwargs)
+
+    def is_narrator_running(self):
+        if os.name != "nt":
+            return False
+
+        tasklist_exe = self._get_windows_system_tool("tasklist.exe")
+        result = self._run_hidden_command(
+            [tasklist_exe, "/FI", "IMAGENAME eq Narrator.exe", "/NH"],
+            timeout=5,
+        )
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "tasklist 执行失败").strip())
+        return "narrator.exe" in result.stdout.lower()
+
+    def get_narrator_status_text(self):
+        if os.name != "nt":
+            return "仅 Windows 可用"
+
+        try:
+            return "已开启" if self.is_narrator_running() else "未开启"
+        except Exception as exc:
+            return f"检查失败: {exc}"
+
+    def start_narrator(self):
+        if os.name != "nt":
+            QMessageBox.warning(self, "不可用", "讲述人功能仅支持 Windows。")
+            return
+
+        try:
+            if self.is_narrator_running():
+                self.add_log("Windows 讲述人已开启")
+                self.set_status("narrator", "已开启")
+                return
+
+            narrator_exe = self._get_windows_system_tool("Narrator.exe")
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            subprocess.Popen([narrator_exe], close_fds=True, creationflags=creationflags)
+            self.add_log("已请求开启 Windows 讲述人")
+            QTimer.singleShot(1500, lambda: self.set_status("narrator", self.get_narrator_status_text()))
+        except Exception as exc:
+            self.add_log(f"开启 Windows 讲述人失败: {exc}")
+            QMessageBox.warning(self, "开启失败", f"开启 Windows 讲述人失败:\n{exc}")
+
+    def stop_narrator(self):
+        if os.name != "nt":
+            QMessageBox.warning(self, "不可用", "讲述人功能仅支持 Windows。")
+            return
+
+        try:
+            if not self.is_narrator_running():
+                self.add_log("Windows 讲述人未开启")
+                self.set_status("narrator", "未开启")
+                return
+
+            taskkill_exe = self._get_windows_system_tool("taskkill.exe")
+            result = self._run_hidden_command([taskkill_exe, "/IM", "Narrator.exe", "/T"], timeout=8)
+            if result.returncode != 0:
+                result = self._run_hidden_command([taskkill_exe, "/IM", "Narrator.exe", "/T", "/F"], timeout=8)
+
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout or "taskkill 执行失败").strip()
+                raise RuntimeError(message)
+
+            self.add_log("已请求关闭 Windows 讲述人")
+            QTimer.singleShot(1200, lambda: self.set_status("narrator", self.get_narrator_status_text()))
+        except Exception as exc:
+            self.add_log(f"关闭 Windows 讲述人失败: {exc}")
+            QMessageBox.warning(self, "关闭失败", f"关闭 Windows 讲述人失败:\n{exc}")
+
+    def _get_current_session_identifier(self):
+        query_exe = self._get_windows_system_tool("query.exe")
+        try:
+            result = self._run_hidden_command([query_exe, "user"], timeout=5)
+        except Exception as exc:
+            result = None
+            parse_note = f"读取远程会话失败: {exc}"
+        else:
+            parse_note = ""
+            if result.returncode != 0:
+                parse_note = (result.stderr or result.stdout or "query user 执行失败").strip()
+            else:
+                lines = result.stdout.splitlines()
+                current_lines = [line for line in lines if line.lstrip().startswith(">")]
+
+                username = os.environ.get("USERNAME", "").lower()
+                if username:
+                    current_lines.extend(
+                        line
+                        for line in lines[1:]
+                        if line.lstrip().lstrip(">").strip().lower().startswith(username)
+                    )
+
+                for line in current_lines:
+                    tokens = line.lstrip().lstrip(">").strip().split()
+                    for token in tokens[1:4]:
+                        if token.isdigit():
+                            return token, ""
+                parse_note = (result.stdout or "未能从 query user 解析当前会话 ID").strip()
+
+        session_name = os.environ.get("SESSIONNAME", "").strip()
+        if session_name and session_name.lower() != "console":
+            return session_name, f"{parse_note}；已改用 SESSIONNAME={session_name}"
+
+        return None, parse_note or "未检测到远程桌面会话"
+
+    def _is_permission_error(self, message):
+        lower_message = message.lower()
+        permission_keywords = ("access is denied", "拒绝访问", "权限")
+        return any(keyword in lower_message or keyword in message for keyword in permission_keywords)
+
+    def _format_tscon_error(self, message):
+        message = message.strip() or "tscon 执行失败"
+        if self._is_permission_error(message):
+            return f"{message}\n\n请以管理员身份运行本软件后重试。"
+        return message
+
+    def _run_tscon_as_admin(self, tscon_exe, session_identifier):
+        try:
+            result = ctypes.windll.shell32.ShellExecuteW(
+                None,
+                "runas",
+                tscon_exe,
+                f"{session_identifier} /dest:console",
+                None,
+                0,
+            )
+        except Exception as exc:
+            return False, str(exc)
+
+        if result <= 32:
+            return False, f"管理员授权启动失败，错误码: {result}"
+        return True, ""
+
+    def disconnect_remote_session(self):
+        if os.name != "nt":
+            QMessageBox.warning(self, "不可用", "断开远程连接功能仅支持 Windows。")
+            return
+
+        session_name = os.environ.get("SESSIONNAME", "").strip()
+        if session_name.lower() == "console":
+            self.add_log("当前已经是控制台会话，无需断开远程连接")
+            QMessageBox.information(self, "无需操作", "当前已经是控制台会话，无需断开远程连接。")
+            return
+
+        session_identifier, note = self._get_current_session_identifier()
+        if note:
+            self.add_log(note)
+        if not session_identifier:
+            QMessageBox.warning(self, "断开失败", "无法识别当前远程桌面会话，请查看日志。")
+            return
+
+        tscon_exe = self._get_windows_system_tool("tscon.exe")
+        self.add_log(f"准备断开远程桌面会话: {session_identifier}")
+        try:
+            result = self._run_hidden_command([tscon_exe, str(session_identifier), "/dest:console"], timeout=10)
+        except Exception as exc:
+            self.add_log(f"断开远程连接失败: {exc}")
+            QMessageBox.warning(self, "断开失败", f"执行 tscon 失败:\n{exc}")
+            return
+
+        if result.returncode != 0:
+            raw_message = (result.stderr or result.stdout or "tscon 执行失败").strip()
+            if self._is_permission_error(raw_message):
+                self.add_log("断开远程连接需要管理员权限，正在请求管理员授权")
+                elevated, elevated_message = self._run_tscon_as_admin(tscon_exe, session_identifier)
+                if elevated:
+                    self.add_log("已发起管理员授权执行断开远程连接命令")
+                    return
+                raw_message = f"{raw_message}\n{elevated_message}"
+
+            message = self._format_tscon_error(raw_message)
+            self.add_log(f"断开远程连接失败: {message}")
+            QMessageBox.warning(self, "断开失败", f"执行 tscon 失败:\n{message}")
+            return
+
+        self.add_log("已执行断开远程连接命令，桌面会话将保持在控制台")
+
     def apply_app_style(self):
         self.setStyleSheet(
             """
@@ -1106,6 +1314,24 @@ class MomoReplyGUI(QWidget):
         check_btn.setObjectName("secondaryButton")
         check_btn.clicked.connect(self.run_startup_check)
 
+        narrator_buttons = QWidget()
+        narrator_layout = QHBoxLayout(narrator_buttons)
+        narrator_layout.setContentsMargins(0, 0, 0, 0)
+        narrator_layout.setSpacing(8)
+
+        start_narrator_btn = QPushButton("开启讲述人")
+        start_narrator_btn.setObjectName("secondaryButton")
+        start_narrator_btn.setToolTip("启动 Windows 讲述人，帮助 uiautomation 识别微信控件")
+        start_narrator_btn.clicked.connect(self.start_narrator)
+
+        stop_narrator_btn = QPushButton("关闭讲述人")
+        stop_narrator_btn.setObjectName("secondaryButton")
+        stop_narrator_btn.setToolTip("关闭 Windows 讲述人")
+        stop_narrator_btn.clicked.connect(self.stop_narrator)
+
+        narrator_layout.addWidget(start_narrator_btn)
+        narrator_layout.addWidget(stop_narrator_btn)
+
         self.start_btn = QPushButton("开始监控")
         self.start_btn.setObjectName("primaryButton")
         self.start_btn.clicked.connect(self.start_monitoring)
@@ -1115,9 +1341,16 @@ class MomoReplyGUI(QWidget):
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_monitoring)
 
+        disconnect_btn = QPushButton("断开远程连接")
+        disconnect_btn.setObjectName("secondaryButton")
+        disconnect_btn.setToolTip("使用 tscon 将当前 RDP 会话切回控制台，避免锁屏导致控件树失效")
+        disconnect_btn.clicked.connect(self.disconnect_remote_session)
+
         action_layout.addWidget(check_btn)
+        action_layout.addWidget(narrator_buttons)
         action_layout.addWidget(self.start_btn)
         action_layout.addWidget(self.stop_btn)
+        action_layout.addWidget(disconnect_btn)
 
         status_panel = self.init_status_panel()
         sidebar_layout.addWidget(action_panel)
