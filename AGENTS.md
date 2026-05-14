@@ -21,8 +21,6 @@ Core dependencies from `requirements.txt`:
 - `PyQt5 5.15.7`
 - `uiautomation 2.0.17`
 - `pyperclip 1.8.2`
-- `keyboard 0.13.5`
-- `pyautogui 0.9.54`
 - `pyinstaller 5.12.0`
 - `pywin32 304`
 

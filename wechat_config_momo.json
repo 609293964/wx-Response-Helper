@@ -1,43 +1,46 @@
 {
     "settings": {
-        "wechat_path": "",
         "language": "zh-CN",
-        "material_folder": "C:\\Users\\lishi\\Desktop\\素材",
         "trigger_sender": "momo",
-        "trigger_keywords": "!,！",
         "active_rules_count": 1,
-        "send_delay": 2.0
+        "send_delay": 2.0,
+        "random_delay": 0
     },
     "rules": [
         {
-            "keywords": "！,!",
-            "folder": "C:/Users/npc/Desktop/photo/cat",
-            "mode": "exact",
-            "reply_type": "image"
+            "keywords": "!,！",
+            "reply_type": "image",
+            "folder": "",
+            "reply_text": "",
+            "mode": "exact"
         },
         {
             "keywords": "",
-            "folder": "C:\\Users\\lishi\\Desktop\\素材",
-            "mode": "contains",
-            "reply_type": "image"
+            "reply_type": "image",
+            "folder": "",
+            "reply_text": "",
+            "mode": "contains"
         },
         {
             "keywords": "",
-            "folder": "C:\\Users\\lishi\\Desktop\\素材",
-            "mode": "contains",
-            "reply_type": "image"
+            "reply_type": "image",
+            "folder": "",
+            "reply_text": "",
+            "mode": "contains"
         },
         {
             "keywords": "",
-            "folder": "C:\\Users\\lishi\\Desktop\\素材",
-            "mode": "contains",
-            "reply_type": "image"
+            "reply_type": "image",
+            "folder": "",
+            "reply_text": "",
+            "mode": "contains"
         },
         {
             "keywords": "",
-            "folder": "C:\\Users\\lishi\\Desktop\\素材",
-            "mode": "contains",
-            "reply_type": "image"
+            "reply_type": "image",
+            "folder": "",
+            "reply_text": "",
+            "mode": "contains"
         }
     ]
 }

@@ -1,17 +1,33 @@
 import os
 import re
-import subprocess
 import threading
 import time
+from ctypes import windll
+from dataclasses import dataclass
+from typing import Callable, Optional, Tuple
 
 import pyperclip
 import uiautomation as auto
 
-from ctypes import windll
-from typing import List, Tuple
-
 from clipboard import setClipboardFiles
 from wechat_locale import WeChatLocale
+
+
+@dataclass
+class AutomationResult:
+    ok: bool
+    message: str
+
+    def __bool__(self):
+        return self.ok
+
+
+def ok(message: str = "操作成功") -> AutomationResult:
+    return AutomationResult(True, message)
+
+
+def fail(message: str) -> AutomationResult:
+    return AutomationResult(False, message)
 
 
 def move(element):
@@ -25,88 +41,36 @@ def click(element):
 
 
 class WeChat:
-    def __init__(self, path, locale="zh-CN"):
-        self.path = path
+    def __init__(self, locale="zh-CN"):
         assert locale in WeChatLocale.getSupportedLocales()
         self.lc = WeChatLocale(locale)
+        self.last_message_monitoring = False
+        self.last_captured_text = ""
+        self.last_message_callback = None
+        self.last_monitor_status = ""
 
-    def is_wechat_visible(self):
+    def check_target_window(self, target_name: str) -> AutomationResult:
+        if not target_name:
+            return fail("目标窗口名为空")
         try:
-            wechat_window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
-            if wechat_window.Exists(0, 0):
-                hwnd = wechat_window.NativeWindowHandle
-                user32 = windll.user32
-                is_visible = user32.IsWindowVisible(hwnd)
-                is_minimized = user32.IsIconic(hwnd)
-                return is_visible and not is_minimized
-            return False
-        except Exception:
-            return False
-
-    def ensure_wechat_visible(self):
-        try:
-            wechat_window = auto.WindowControl(Depth=1, Name=self.lc.weixin, searchDepth=1)
-            if wechat_window.Exists(0, 0):
-                hwnd = wechat_window.NativeWindowHandle
-                user32 = windll.user32
-                if user32.IsIconic(hwnd):
-                    user32.OpenIconicWindow(hwnd)
-                    time.sleep(1)
-                user32.SetForegroundWindow(hwnd)
-                wechat_window.SetFocus()
-                return True
-        except Exception:
-            pass
-        return False
-
-    def open_wechat(self):
-        if self.is_wechat_visible():
-            wechat_window = self.get_wechat()
-            wechat_window.SetFocus()
-            return
-        if self.ensure_wechat_visible():
-            time.sleep(1)
-            if self.is_wechat_visible():
-                return
-        auto.SendKeys("{Ctrl}{Alt}w")
-        time.sleep(2)
-        if not self.is_wechat_visible() and self.path and os.path.exists(self.path):
-            subprocess.Popen(self.path)
-            time.sleep(5)
-
-    def get_wechat(self):
-        return auto.WindowControl(Depth=1, Name=self.lc.weixin)
-
-    def prevent_offline(self):
-        self.open_wechat()
-        self.get_wechat()
-        search_box = auto.EditControl(Depth=8, Name=self.lc.search)
-        click(search_box)
-
-    def get_contact(self, name):
-        self.open_wechat()
-        self.get_wechat()
-        search_box = auto.EditControl(Depth=13, Name=self.lc.search)
-        click(search_box)
-        pyperclip.copy(name)
-        auto.SendKeys("{Ctrl}v")
-        time.sleep(0.3)
-        list_control = auto.ListControl(Depth=4)
-        for item in list_control.GetChildren():
-            if "XTableCell" not in item.ClassName:
-                click(item)
-                break
-        tool_bar = auto.ToolBarControl(Depth=15)
-        move(tool_bar)
-        click(tool_bar)
+            win = self.get_independent_window(target_name)
+        except Exception as exc:
+            return fail(f"检查目标窗口失败: {exc}")
+        if win:
+            return ok(f"已找到独立聊天窗口: {target_name}")
+        return fail(f"未找到独立聊天窗口: {target_name}")
 
     def press_enter(self):
         auto.SendKeys("{enter}")
 
-    def paste_text(self, text: str) -> None:
-        pyperclip.copy(text)
-        time.sleep(0.3)
-        auto.SendKeys("{Ctrl}v")
+    def paste_text(self, text: str) -> AutomationResult:
+        try:
+            pyperclip.copy(text)
+            time.sleep(0.3)
+            auto.SendKeys("{Ctrl}v")
+            return ok("文本已粘贴到输入框")
+        except Exception as exc:
+            return fail(f"文本粘贴失败: {exc}")
 
     def get_independent_window(self, target_name):
         win = auto.WindowControl(Name=target_name, searchDepth=1)
@@ -114,7 +78,7 @@ class WeChat:
             return win
         return None
 
-    def _activate_window(self, chat_win) -> bool:
+    def _activate_window(self, chat_win) -> AutomationResult:
         try:
             hwnd = chat_win.NativeWindowHandle
             user32 = windll.user32
@@ -125,14 +89,14 @@ class WeChat:
             user32.SetForegroundWindow(hwnd)
             chat_win.SetFocus()
             time.sleep(0.3)
-            return True
-        except Exception:
+            return ok("聊天窗口已激活")
+        except Exception as exc:
             try:
                 chat_win.SetFocus()
                 time.sleep(0.3)
-                return True
+                return ok("聊天窗口已通过 SetFocus 激活")
             except Exception:
-                return False
+                return fail(f"无法激活聊天窗口: {exc}")
 
     def _find_chat_input(self, chat_win):
         candidates = [
@@ -151,12 +115,11 @@ class WeChat:
     def _focus_independent_chat_input(self, target_name: str):
         chat_win = self.get_independent_window(target_name)
         if not chat_win:
-            print(f"发送失败：找不到名为 '{target_name}' 的独立窗口。请确认窗口是否已拖出！")
-            return None
+            return None, fail(f"找不到名为 '{target_name}' 的独立聊天窗口，请确认聊天窗口已经单独拖出")
 
-        if not self._activate_window(chat_win):
-            print(f"发送失败：无法激活窗口 '{target_name}'。")
-            return None
+        activate_result = self._activate_window(chat_win)
+        if not activate_result:
+            return None, activate_result
 
         current_mouse_pos = auto.GetCursorPos()
         try:
@@ -165,18 +128,17 @@ class WeChat:
                 move(edit_input)
                 click(edit_input)
                 time.sleep(0.2)
-                return chat_win
+                return chat_win, ok("已定位并聚焦输入框")
 
             rect = chat_win.BoundingRectangle
             if not rect:
-                print(f"发送失败：未能定位 '{target_name}' 的输入区域。")
-                return None
+                return None, fail(f"未能定位 '{target_name}' 的输入区域")
 
             click_x = rect.left + (rect.right - rect.left) // 2
             click_y = rect.bottom - 60
             auto.Click(click_x, click_y)
             time.sleep(0.2)
-            return chat_win
+            return chat_win, ok("未找到输入控件，已通过窗口底部坐标聚焦输入区")
         finally:
             auto.SetCursorPos(current_mouse_pos[0], current_mouse_pos[1])
 
@@ -235,16 +197,16 @@ class WeChat:
         except Exception:
             return 0, ""
 
-    def _wait_for_message_change(self, chat_win, before_state, timeout=8.0) -> bool:
+    def _wait_for_message_change(self, chat_win, before_state, timeout=8.0) -> AutomationResult:
         deadline = time.time() + timeout
         while time.time() < deadline:
             after_state = self._capture_message_state(chat_win)
             if after_state[0] > before_state[0]:
-                return True
+                return ok("发送后消息列表数量已变化")
             if after_state != before_state and after_state[0] > 0:
-                return True
+                return ok("发送后消息列表内容已变化")
             time.sleep(0.4)
-        return False
+        return fail("发送后未检测到消息列表变化，可能未发送成功或微信控件未刷新")
 
     def _get_toolbar_buttons(self, chat_win):
         buttons = []
@@ -268,7 +230,7 @@ class WeChat:
             pass
         return buttons
 
-    def _click_send_button(self, chat_win) -> bool:
+    def _click_send_button(self, chat_win) -> AutomationResult:
         candidates = self._get_toolbar_buttons(chat_win)
         if not candidates:
             try:
@@ -295,12 +257,13 @@ class WeChat:
                 pass
 
         button = exact_match or fallback_match
-        if button is not None:
-            click(button)
-            return True
-        return False
+        if button is None:
+            return fail("未找到发送按钮")
 
-    def _click_send_file_button(self, chat_win) -> bool:
+        click(button)
+        return ok("已点击发送按钮")
+
+    def _click_send_file_button(self, chat_win) -> AutomationResult:
         exact_match = None
         fallback_match = None
         for control in self._get_toolbar_buttons(chat_win):
@@ -317,14 +280,16 @@ class WeChat:
                 pass
 
         button = exact_match or fallback_match
-        if button is not None:
-            click(button)
-            return True
-        return False
+        if button is None:
+            return fail("未找到发送文件按钮")
 
-    def _attach_file_via_dialog(self, chat_win, path: str) -> bool:
-        if not self._click_send_file_button(chat_win):
-            return False
+        click(button)
+        return ok("已点击发送文件按钮")
+
+    def _attach_file_via_dialog(self, chat_win, path: str) -> AutomationResult:
+        click_file_result = self._click_send_file_button(chat_win)
+        if not click_file_result:
+            return click_file_result
 
         dialog = None
         deadline = time.time() + 5.0
@@ -338,126 +303,139 @@ class WeChat:
             time.sleep(0.2)
 
         if dialog is None or not dialog.Exists(0.2, 0):
-            return False
+            return fail("点击发送文件后未出现文件选择窗口")
 
         try:
             dialog.SetFocus()
         except Exception:
             pass
 
-        pyperclip.copy(path)
-        time.sleep(0.2)
-        auto.SendKeys("{Ctrl}v")
-        time.sleep(0.2)
-        auto.SendKeys("{Enter}")
-        time.sleep(1.5)
-        return True
+        try:
+            pyperclip.copy(path)
+            time.sleep(0.2)
+            auto.SendKeys("{Ctrl}v")
+            time.sleep(0.2)
+            auto.SendKeys("{Enter}")
+            time.sleep(1.5)
+            return ok("已通过文件选择窗口附加文件")
+        except Exception as exc:
+            return fail(f"文件选择窗口附加文件失败: {exc}")
 
-    def send_msg(self, name, at_names: List[str] = None, text: str = None, search_user: bool = True) -> bool:
-        chat_win = None
-        before_state = None
-
-        if search_user:
-            self.get_contact(name)
-        else:
-            chat_win = self._focus_independent_chat_input(name)
-            if not chat_win:
-                return False
-            before_state = self._capture_message_state(chat_win)
-
-        if at_names is not None:
-            for at_name in at_names:
-                if at_name == "所有人":
-                    auto.SendKeys("@{UP}{enter}")
-                elif at_name != "":
-                    auto.SendKeys(f"@{at_name}")
-                    auto.SendKeys("{enter}")
+    def send_msg(self, name, text: str = None) -> AutomationResult:
+        chat_win, focus_result = self._focus_independent_chat_input(name)
+        if not chat_win:
+            return focus_result
+        before_state = self._capture_message_state(chat_win)
 
         if text is not None:
-            self.paste_text(text)
+            paste_result = self.paste_text(text)
+            if not paste_result:
+                return paste_result
 
-        self.press_enter()
+        try:
+            self.press_enter()
+        except Exception as exc:
+            return fail(f"按 Enter 发送文本失败: {exc}")
 
-        if chat_win and before_state is not None:
-            return self._wait_for_message_change(chat_win, before_state, timeout=5.0)
-        return True
+        wait_result = self._wait_for_message_change(chat_win, before_state, timeout=5.0)
+        if wait_result:
+            return ok("文本发送成功")
+        return wait_result
 
-    def send_file(self, name: str, path: str, search_user: bool = True) -> bool:
+    def send_file(self, name: str, path: str) -> AutomationResult:
         if not path or not os.path.exists(path):
-            print(f"发送失败：文件不存在 -> {path}")
-            return False
+            return fail(f"文件不存在: {path}")
 
-        chat_win = None
-        before_state = None
+        chat_win, focus_result = self._focus_independent_chat_input(name)
+        if not chat_win:
+            return focus_result
+        before_state = self._capture_message_state(chat_win)
 
-        if search_user:
-            self.get_contact(name)
-        else:
-            chat_win = self._focus_independent_chat_input(name)
-            if not chat_win:
-                return False
-            before_state = self._capture_message_state(chat_win)
-
-        setClipboardFiles([path])
+        try:
+            setClipboardFiles([path])
+        except Exception as exc:
+            return fail(f"设置文件剪贴板失败: {exc}")
         time.sleep(0.5)
 
-        if chat_win:
-            self._activate_window(chat_win)
+        self._activate_window(chat_win)
+        time.sleep(0.2)
+        rect = chat_win.BoundingRectangle
+        if rect:
+            auto.Click(rect.left + (rect.right - rect.left) // 2, rect.bottom - 60)
             time.sleep(0.2)
-            rect = chat_win.BoundingRectangle
-            if rect:
-                auto.Click(rect.left + (rect.right - rect.left) // 2, rect.bottom - 60)
-                time.sleep(0.2)
 
-        auto.SendKeys("{Ctrl}v")
-        time.sleep(1.5)
-        self.press_enter()
+        try:
+            auto.SendKeys("{Ctrl}v")
+            time.sleep(1.5)
+            self.press_enter()
+        except Exception as exc:
+            return fail(f"粘贴并发送文件失败: {exc}")
 
-        if chat_win and before_state is not None:
-            if self._wait_for_message_change(chat_win, before_state, timeout=4.0):
-                return True
+        wait_result = self._wait_for_message_change(chat_win, before_state, timeout=4.0)
+        if wait_result:
+            return ok("图片发送成功")
 
-            if self._attach_file_via_dialog(chat_win, path):
-                if self._wait_for_message_change(chat_win, before_state, timeout=5.0):
-                    return True
-                if self._click_send_button(chat_win):
-                    return self._wait_for_message_change(chat_win, before_state, timeout=5.0)
+        attach_result = self._attach_file_via_dialog(chat_win, path)
+        if attach_result:
+            wait_result = self._wait_for_message_change(chat_win, before_state, timeout=5.0)
+            if wait_result:
+                return ok("图片通过文件选择窗口发送成功")
 
-            if self._click_send_button(chat_win):
+            click_send_result = self._click_send_button(chat_win)
+            if click_send_result:
                 return self._wait_for_message_change(chat_win, before_state, timeout=5.0)
+            return click_send_result
 
-            return False
-        return True
+        click_send_result = self._click_send_button(chat_win)
+        if click_send_result:
+            return self._wait_for_message_change(chat_win, before_state, timeout=5.0)
 
-    def start_last_message_monitor(self, target_name=None, callback=None, check_interval=1):
-        if hasattr(self, "last_message_monitoring") and self.last_message_monitoring:
-            print("精准最后一条消息监控已经在运行中")
+        return fail(f"{wait_result.message}; {attach_result.message}; {click_send_result.message}")
+
+    def _emit_monitor_status(self, status_callback: Optional[Callable[[str], None]], message: str) -> None:
+        if message == self.last_monitor_status:
             return
+        self.last_monitor_status = message
+        print(message)
+        if status_callback:
+            try:
+                status_callback(message)
+            except Exception:
+                pass
+
+    def start_last_message_monitor(self, target_name=None, callback=None, check_interval=1, status_callback=None):
+        if self.last_message_monitoring:
+            return fail("最后一条消息监控已经在运行中")
 
         self.last_message_monitoring = True
         self.last_captured_text = ""
         self.last_message_callback = callback
+        self.last_monitor_status = ""
 
         def monitor_loop():
             _uia_init = auto.UIAutomationInitializerInThread()
-            print(f"已启动独立窗口模式监听，目标窗口: [{target_name}]")
+            self._emit_monitor_status(status_callback, f"已启动监听: {target_name or '未设置目标'}")
 
             while self.last_message_monitoring:
                 try:
                     if not target_name:
+                        self._emit_monitor_status(status_callback, "目标窗口名为空")
                         time.sleep(check_interval)
                         continue
 
                     chat_win = self.get_independent_window(target_name)
                     if not chat_win:
+                        self._emit_monitor_status(status_callback, f"未找到目标窗口: {target_name}")
                         time.sleep(check_interval)
                         continue
 
                     msg_list = self._get_message_list(chat_win)
                     if not msg_list:
+                        self._emit_monitor_status(status_callback, "已找到窗口，但未找到消息列表")
                         time.sleep(check_interval)
                         continue
 
+                    self._emit_monitor_status(status_callback, f"监听中: {target_name}")
                     items = msg_list.GetChildren()
                     if items:
                         last_text = ""
@@ -481,23 +459,20 @@ class WeChat:
                             if self.last_message_callback:
                                 try:
                                     self.last_message_callback(last_text, current_time)
-                                except Exception as e:
-                                    print(f"执行回调报错: {e}")
-                except Exception:
-                    pass
+                                except Exception as exc:
+                                    print(f"执行回调报错: {exc}")
+                except Exception as exc:
+                    self._emit_monitor_status(status_callback, f"监听异常: {exc}")
 
                 time.sleep(check_interval)
 
             _uia_init = None
+            self._emit_monitor_status(status_callback, "监听已停止")
 
         monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
         monitor_thread.start()
+        return ok("已启动最后一条消息监控")
 
     def stop_last_message_monitor(self):
-        if hasattr(self, "last_message_monitoring"):
-            self.last_message_monitoring = False
-            print("精准最后一条消息监控已停止")
-
-
-if __name__ == "__main__":
-    pass
+        self.last_message_monitoring = False
+        return ok("已请求停止最后一条消息监控")

@@ -1,89 +1,208 @@
-import sys
-import time
+import datetime
+import json
 import os
 import random
-import json
-import datetime
+import shutil
+import sys
 import threading
-import uiautomation as auto
+import time
+from pathlib import Path
 
-from PyQt5.QtWidgets import *
-from PyQt5.QtCore import *
-from PyQt5.QtGui import *
+import uiautomation as auto
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtWidgets import (
+    QAbstractItemView,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QMessageBox,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
 from ui_auto_wechat import WeChat
 from wechat_locale import WeChatLocale
 
+
 class MomoReplyGUI(QWidget):
     add_log_signal = pyqtSignal(str)
-    # [新增] 发送图片后实时更新UI信号，传参为被触发的规则索引
     update_img_count_signal = pyqtSignal(int)
+    status_signal = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
-        self.config_path = "wechat_config_momo.json"
-        
-        default_material_folder = os.path.join(os.path.expanduser("~"), "Desktop", "素材")
-        
-        if os.path.exists(self.config_path):
-            with open(self.config_path, "r", encoding="utf-8") as r:
-                self.config = json.load(r)
-                if "settings" not in self.config:
-                    self.config["settings"] = {}
-                if "rules" not in self.config:
-                    self.config["rules"] = []
-        else:
-            self.config = {
-                "settings": {
-                    "wechat_path": "",
-                    "language": "zh-CN",
-                    "trigger_sender": "momo",
-                    "active_rules_count": 1
-                },
-                "rules": [
-                    {"keywords": "!,！", "reply_type": "image", "folder": default_material_folder, "reply_text": "", "mode": "exact"}
-                ]
-            }
-            self.save_config()
+        self.base_dir = Path(__file__).resolve().parent
+        self.config_path = self.base_dir / "wechat_config_momo.json"
+        self.logs_dir = self.base_dir / "logs"
+        self.app_log_path = self.logs_dir / "app.log"
+        self.config_load_notes = []
 
-        while len(self.config.get("rules", [])) < 5:
-            self.config["rules"].append({"keywords": "", "reply_type": "image", "folder": default_material_folder, "reply_text": "", "mode": "contains"})
+        self.config = self.load_config()
+        self.wechat = WeChat(locale=self.config.get("settings", {}).get("language", "zh-CN"))
 
-        self.wechat = WeChat(
-            path=self.config.get("settings", {}).get("wechat_path", ""),
-            locale=self.config.get("settings", {}).get("language", "zh-CN"),
-        )
-        
         self.monitoring = False
         self.last_triggered = False
         self.trigger_state_lock = threading.Lock()
         self.trigger_token = 0
         self.auto_timer = None
-        self.rule_img_count_labels = {} # 用于存储各个规则的图片数量Label引用
+        self.status_timer = None
+        self.rule_img_count_labels = {}
+        self.status_labels = {}
 
         self.add_log_signal.connect(self._do_add_log)
         self.update_img_count_signal.connect(self._do_update_img_count)
-        
+        self.status_signal.connect(self._do_update_status)
+
         self.initUI()
-        
+        self.start_status_timer()
+
         if self.config.get("settings", {}).get("enable_auto_timer", False):
             self.enable_auto_timer.setChecked(True)
             self.start_auto_timer_check()
-        
+
         self.show_wechat_open_notice()
+        QTimer.singleShot(100, self.run_startup_check)
+
+    def default_config(self):
+        return {
+            "settings": {
+                "language": "zh-CN",
+                "trigger_sender": "momo",
+                "active_rules_count": 1,
+                "send_delay": 2.0,
+                "random_delay": 0,
+            },
+            "rules": [
+                {"keywords": "!,！", "reply_type": "image", "folder": "", "reply_text": "", "mode": "exact"},
+                {"keywords": "", "reply_type": "image", "folder": "", "reply_text": "", "mode": "contains"},
+                {"keywords": "", "reply_type": "image", "folder": "", "reply_text": "", "mode": "contains"},
+                {"keywords": "", "reply_type": "image", "folder": "", "reply_text": "", "mode": "contains"},
+                {"keywords": "", "reply_type": "image", "folder": "", "reply_text": "", "mode": "contains"},
+            ],
+        }
+
+    def load_config(self):
+        if not self.config_path.exists():
+            config = self.default_config()
+            self.config_load_notes.append("未找到配置文件，已创建默认配置")
+            self.config = config
+            self.save_config()
+            return config
+
+        try:
+            with self.config_path.open("r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except Exception as exc:
+            backup_path = self.config_path.with_suffix(f".broken_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            try:
+                shutil.copy2(self.config_path, backup_path)
+                self.config_load_notes.append(f"配置文件读取失败，已备份到 {backup_path.name}")
+            except Exception:
+                self.config_load_notes.append("配置文件读取失败，且备份失败")
+            self.config_load_notes.append(f"已使用默认配置: {exc}")
+            config = self.default_config()
+
+        changed = self.normalize_config(config)
+        if changed:
+            self.config_load_notes.append("已自动修复配置字段")
+            self.config = config
+            self.save_config()
+        return config
+
+    def normalize_config(self, config):
+        changed = False
+        defaults = self.default_config()
+
+        if not isinstance(config, dict):
+            config.clear()
+            config.update(defaults)
+            return True
+
+        settings = config.setdefault("settings", {})
+        if not isinstance(settings, dict):
+            config["settings"] = defaults["settings"].copy()
+            settings = config["settings"]
+            changed = True
+
+        for stale_key in ("wechat_path", "material_folder", "trigger_keywords", "monitor_backend"):
+            if stale_key in settings:
+                settings.pop(stale_key, None)
+                changed = True
+
+        for key, value in defaults["settings"].items():
+            if key not in settings:
+                settings[key] = value
+                changed = True
+
+        try:
+            active_count = int(settings.get("active_rules_count", 1))
+        except (TypeError, ValueError):
+            active_count = 1
+        active_count = max(1, min(5, active_count))
+        if settings.get("active_rules_count") != active_count:
+            settings["active_rules_count"] = active_count
+            changed = True
+
+        rules = config.setdefault("rules", [])
+        if not isinstance(rules, list):
+            rules = []
+            config["rules"] = rules
+            changed = True
+
+        while len(rules) < 5:
+            rules.append(defaults["rules"][len(rules)].copy())
+            changed = True
+        if len(rules) > 5:
+            del rules[5:]
+            changed = True
+
+        for index, rule in enumerate(rules):
+            if not isinstance(rule, dict):
+                rules[index] = defaults["rules"][index].copy()
+                changed = True
+                continue
+            for key, value in defaults["rules"][index].items():
+                if key not in rule:
+                    rule[key] = value
+                    changed = True
+            if rule.get("reply_type") not in ("image", "text"):
+                rule["reply_type"] = "image"
+                changed = True
+            if rule.get("mode") not in ("exact", "contains"):
+                rule["mode"] = "exact"
+                changed = True
+
+        return changed
 
     def save_config(self):
-        with open(self.config_path, "w", encoding="utf8") as w:
-            json.dump(self.config, w, indent=4, ensure_ascii=False)
+        with self.config_path.open("w", encoding="utf-8") as handle:
+            json.dump(self.config, handle, indent=4, ensure_ascii=False)
 
     def get_valid_images(self, folder):
-        if not os.path.exists(folder):
+        if not folder or not os.path.exists(folder):
             return []
-        image_extensions = {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'}
+        image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
         images = []
         for file in os.listdir(folder):
+            path = os.path.join(folder, file)
+            if not os.path.isfile(path):
+                continue
             ext = os.path.splitext(file)[1].lower()
             if ext in image_extensions:
-                images.append(os.path.join(folder, file))
+                images.append(path)
         return images
 
     def closeEvent(self, event):
@@ -91,6 +210,8 @@ class MomoReplyGUI(QWidget):
             self.stop_monitoring()
         if self.auto_timer is not None:
             self.stop_auto_timer_check()
+        if self.status_timer is not None:
+            self.status_timer.stop()
         QApplication.quit()
         event.accept()
 
@@ -100,21 +221,19 @@ class MomoReplyGUI(QWidget):
         msg_box.setWindowTitle("重要提示")
         msg_box.setText("微信自动化操作说明")
         msg_box.setInformativeText(
-            "⚠️ 使用说明：\n"
-            "• 支持将聊天窗口单独拖出，只要填对【目标对话/触发者昵称】即可\n"
-            "• 可自由选择回复类型：【发送素材图片】或【发送指定文本】\n"
-            "• 图片发送后，会自动从文件夹中删除并实时刷新图片数量\n"
-            "• 日志超长时会自动备份到本地并清理，避免卡死\n"
+            "使用前请确认 Windows 讲述人模式已开启。\n"
+            "聊天窗口需要单独拖出，窗口标题要和“目标对话/触发者昵称”一致。\n"
+            "图片发送成功后会移动到素材目录下的 sent 文件夹。"
         )
         msg_box.setStandardButtons(QMessageBox.Ok)
         msg_box.exec_()
 
     def init_language_choose(self):
         def switch_language():
-            if lang_zh_CN_btn.isChecked():
+            if lang_zh_cn_btn.isChecked():
                 self.wechat.lc = WeChatLocale("zh-CN")
                 self.config["settings"]["language"] = "zh-CN"
-            elif lang_zh_TW_btn.isChecked():
+            elif lang_zh_tw_btn.isChecked():
                 self.wechat.lc = WeChatLocale("zh-TW")
                 self.config["settings"]["language"] = "zh-TW"
             elif lang_en_btn.isChecked():
@@ -124,21 +243,24 @@ class MomoReplyGUI(QWidget):
 
         lang_group = QGroupBox("系统语言设置")
         lang_layout = QHBoxLayout()
-        lang_zh_CN_btn = QRadioButton("简体中文")
-        lang_zh_TW_btn = QRadioButton("繁体中文")
+        lang_zh_cn_btn = QRadioButton("简体中文")
+        lang_zh_tw_btn = QRadioButton("繁体中文")
         lang_en_btn = QRadioButton("English")
 
         current_lang = self.config.get("settings", {}).get("language", "zh-CN")
-        if current_lang == "zh-CN": lang_zh_CN_btn.setChecked(True)
-        elif current_lang == "zh-TW": lang_zh_TW_btn.setChecked(True)
-        elif current_lang == "en-US": lang_en_btn.setChecked(True)
+        if current_lang == "zh-CN":
+            lang_zh_cn_btn.setChecked(True)
+        elif current_lang == "zh-TW":
+            lang_zh_tw_btn.setChecked(True)
+        elif current_lang == "en-US":
+            lang_en_btn.setChecked(True)
 
-        lang_zh_CN_btn.clicked.connect(switch_language)
-        lang_zh_TW_btn.clicked.connect(switch_language)
+        lang_zh_cn_btn.clicked.connect(switch_language)
+        lang_zh_tw_btn.clicked.connect(switch_language)
         lang_en_btn.clicked.connect(switch_language)
 
-        lang_layout.addWidget(lang_zh_CN_btn)
-        lang_layout.addWidget(lang_zh_TW_btn)
+        lang_layout.addWidget(lang_zh_cn_btn)
+        lang_layout.addWidget(lang_zh_tw_btn)
         lang_layout.addWidget(lang_en_btn)
         lang_group.setLayout(lang_layout)
         return lang_group
@@ -146,30 +268,24 @@ class MomoReplyGUI(QWidget):
     def init_settings(self):
         settings_config = self.config.get("settings", {})
         main_layout = QVBoxLayout()
-        
-        # --- 基础设置 ---
+
         base_group = QGroupBox("基础设置")
         base_layout = QFormLayout()
-        wechat_path_input = QLineEdit(settings_config.get("wechat_path", ""))
-        wechat_path_btn = QPushButton("浏览...")
-        wechat_path_btn.clicked.connect(lambda: wechat_path_input.setText(QFileDialog.getOpenFileName(self, "选择微信.exe", "", "可执行文件(*.exe)")[0] or wechat_path_input.text()) or self.config["settings"].update({"wechat_path": wechat_path_input.text()}) or self.save_config())
-        
-        hbox_wechat = QHBoxLayout()
-        hbox_wechat.addWidget(wechat_path_input)
-        hbox_wechat.addWidget(wechat_path_btn)
-        base_layout.addRow("微信exe路径:", hbox_wechat)
 
         trigger_sender_input = QLineEdit(settings_config.get("trigger_sender", "momo"))
         trigger_sender_input.setPlaceholderText("填入聊天窗口的名字(如: momo)")
-        trigger_sender_input.editingFinished.connect(lambda: self.config["settings"].update({"trigger_sender": trigger_sender_input.text()}) or self.save_config())
+        trigger_sender_input.editingFinished.connect(
+            lambda: self.config["settings"].update({"trigger_sender": trigger_sender_input.text().strip()})
+            or self.save_config()
+            or self.refresh_runtime_status()
+        )
         base_layout.addRow("目标对话/触发者昵称:", trigger_sender_input)
         base_group.setLayout(base_layout)
         main_layout.addWidget(base_group)
 
-        # --- 多规则配置 ---
         rule_group = QGroupBox("触发与回复规则设置")
         rule_layout = QVBoxLayout()
-        
+
         combo_layout = QHBoxLayout()
         combo_layout.addWidget(QLabel("启用的规则数量 (1~5):"))
         self.rule_count_combo = QComboBox()
@@ -180,8 +296,8 @@ class MomoReplyGUI(QWidget):
         rule_layout.addLayout(combo_layout)
 
         self.rules_tabs = QTabWidget()
-        self.rule_img_count_labels = {} # 字典，用于索引每个 Tab 的数量Label
-        
+        self.rule_img_count_labels = {}
+
         for i in range(5):
             tab = QWidget()
             tab_layout = QFormLayout()
@@ -189,28 +305,30 @@ class MomoReplyGUI(QWidget):
 
             kw_input = QLineEdit(rule_data.get("keywords", ""))
             kw_input.setPlaceholderText("用英文逗号分隔，例如: !,！")
-            kw_input.editingFinished.connect(lambda idx=i, edit=kw_input: self.config["rules"][idx].update({"keywords": edit.text()}) or self.save_config())
+            kw_input.editingFinished.connect(
+                lambda idx=i, edit=kw_input: self.config["rules"][idx].update({"keywords": edit.text()})
+                or self.save_config()
+            )
             tab_layout.addRow("触发关键词:", kw_input)
-            
-            # [新增] 回复类型下拉框
+
             type_combo = QComboBox()
             type_combo.addItems(["发送素材图片", "发送指定文本"])
-            
-            # 图片设置组件
+
             folder_w = QWidget()
             folder_layout = QHBoxLayout(folder_w)
-            folder_layout.setContentsMargins(0,0,0,0)
+            folder_layout.setContentsMargins(0, 0, 0, 0)
             folder_input = QLineEdit(rule_data.get("folder", ""))
-            folder_btn = QPushButton("浏览...")
+            folder_input.setPlaceholderText("选择或粘贴图片素材文件夹路径")
+            folder_btn = QPushButton("选择目录")
+            folder_btn.setFixedWidth(92)
             folder_layout.addWidget(folder_input)
             folder_layout.addWidget(folder_btn)
             folder_info = QLabel("图片数量: 0")
-            self.rule_img_count_labels[i] = folder_info  # 绑定记录
-            
-            # 文本设置组件
+            self.rule_img_count_labels[i] = folder_info
+
             text_w = QWidget()
             text_layout = QHBoxLayout(text_w)
-            text_layout.setContentsMargins(0,0,0,0)
+            text_layout.setContentsMargins(0, 0, 0, 0)
             text_input = QLineEdit(rule_data.get("reply_text", ""))
             text_input.setPlaceholderText("填入触发后需要回复的文本内容")
             text_layout.addWidget(text_input)
@@ -219,8 +337,7 @@ class MomoReplyGUI(QWidget):
             tab_layout.addRow("图片目录:", folder_w)
             tab_layout.addRow("", folder_info)
             tab_layout.addRow("回复文本:", text_w)
-            
-            # 逻辑函数
+
             def update_visibility(idx, cb, fw, cl, tw):
                 is_img = cb.currentIndex() == 0
                 fw.setVisible(is_img)
@@ -231,116 +348,219 @@ class MomoReplyGUI(QWidget):
 
             def make_folder_browser(idx, f_input, f_info):
                 def browse():
-                    d = QFileDialog.getExistingDirectory(self, f"选择规则 {idx+1} 的素材")
-                    if d:
-                        f_input.setText(d)
-                        self.config["rules"][idx]["folder"] = d
-                        self.save_config()
-                        imgs = self.get_valid_images(d)
-                        f_info.setText(f"图片数量: {len(imgs)}")
+                    current_folder = f_input.text().strip()
+                    if not os.path.isdir(current_folder):
+                        desktop_folder = Path.home() / "Desktop"
+                        current_folder = str(desktop_folder if desktop_folder.exists() else Path.home())
+
+                    dialog = QFileDialog(self, f"选择规则 {idx + 1} 的图片素材目录")
+                    dialog.setFileMode(QFileDialog.Directory)
+                    dialog.setOption(QFileDialog.ShowDirsOnly, True)
+                    dialog.setOption(QFileDialog.DontUseNativeDialog, True)
+                    dialog.setDirectory(current_folder)
+
+                    if dialog.exec_() != QFileDialog.Accepted:
+                        return
+
+                    selected = dialog.selectedFiles()
+                    if not selected:
+                        return
+
+                    folder = selected[0]
+                    f_input.setText(folder)
+                    self.config["rules"][idx]["folder"] = folder
+                    self.save_config()
+                    imgs = self.get_valid_images(folder)
+                    f_info.setText(f"图片数量: {len(imgs)}")
+                    self.add_log(f"规则 {idx + 1} 图片目录已选择: {folder}")
                 return browse
 
             def update_count(idx, f_input, f_info):
-                self.config["rules"][idx]["folder"] = f_input.text()
+                self.config["rules"][idx]["folder"] = f_input.text().strip()
                 self.save_config()
-                imgs = self.get_valid_images(f_input.text())
+                imgs = self.get_valid_images(f_input.text().strip())
                 f_info.setText(f"图片数量: {len(imgs)}")
-                
+
             def update_text(idx, edit):
                 self.config["rules"][idx]["reply_text"] = edit.text()
                 self.save_config()
-            
-            # 信号连接
-            type_combo.currentIndexChanged.connect(lambda _, idx=i, cb=type_combo, fw=folder_w, cl=folder_info, tw=text_w: update_visibility(idx, cb, fw, cl, tw))
+
+            type_combo.currentIndexChanged.connect(
+                lambda _, idx=i, cb=type_combo, fw=folder_w, cl=folder_info, tw=text_w: update_visibility(
+                    idx, cb, fw, cl, tw
+                )
+            )
             folder_btn.clicked.connect(make_folder_browser(i, folder_input, folder_info))
-            folder_input.editingFinished.connect(lambda idx=i, f_in=folder_input, f_inf=folder_info: update_count(idx, f_in, f_inf))
+            folder_input.editingFinished.connect(
+                lambda idx=i, f_in=folder_input, f_inf=folder_info: update_count(idx, f_in, f_inf)
+            )
             text_input.editingFinished.connect(lambda idx=i, edit=text_input: update_text(idx, edit))
-            
-            # 初始状态渲染
+
             curr_type = rule_data.get("reply_type", "image")
             type_combo.setCurrentIndex(0 if curr_type == "image" else 1)
             update_visibility(i, type_combo, folder_w, folder_info, text_w)
             update_count(i, folder_input, folder_info)
 
-            # 匹配模式
             mode_layout = QHBoxLayout()
             rb_exact = QRadioButton("只匹配单独关键词(精确)")
             rb_contains = QRadioButton("包含关键词即可触发(模糊)")
-            if rule_data.get("mode", "exact") == "exact": rb_exact.setChecked(True)
-            else: rb_contains.setChecked(True)
+            if rule_data.get("mode", "exact") == "exact":
+                rb_exact.setChecked(True)
+            else:
+                rb_contains.setChecked(True)
+
             def update_mode(idx, exact_btn):
                 self.config["rules"][idx]["mode"] = "exact" if exact_btn.isChecked() else "contains"
                 self.save_config()
+
             rb_exact.clicked.connect(lambda checked, idx=i, btn=rb_exact: update_mode(idx, btn))
             rb_contains.clicked.connect(lambda checked, idx=i, btn=rb_exact: update_mode(idx, btn))
             mode_layout.addWidget(rb_exact)
             mode_layout.addWidget(rb_contains)
             tab_layout.addRow("匹配模式:", mode_layout)
-            
+
             tab.setLayout(tab_layout)
-            self.rules_tabs.addTab(tab, f"规则 {i+1}")
+            self.rules_tabs.addTab(tab, f"规则 {i + 1}")
 
         def on_rule_count_changed():
             count = int(self.rule_count_combo.currentText())
             self.config["settings"]["active_rules_count"] = count
             self.save_config()
-            for i in range(5):
-                self.rules_tabs.setTabEnabled(i, i < count)
-                
+            for index in range(5):
+                self.rules_tabs.setTabEnabled(index, index < count)
+
         self.rule_count_combo.currentIndexChanged.connect(on_rule_count_changed)
         on_rule_count_changed()
-        
+
         rule_layout.addWidget(self.rules_tabs)
         rule_group.setLayout(rule_layout)
         main_layout.addWidget(rule_group)
 
-        # --- 延迟和定时 ---
+        return main_layout
+
+    def init_time_settings(self):
+        settings_config = self.config.get("settings", {})
+        main_layout = QVBoxLayout()
+
         time_group = QGroupBox("延迟及自动启停")
         time_layout = QFormLayout()
-        
+
         self.delay_spin = QDoubleSpinBox()
-        self.delay_spin.setRange(0, 60); self.delay_spin.setValue(settings_config.get("send_delay", 0)); self.delay_spin.setSingleStep(0.5)
-        self.delay_spin.valueChanged.connect(lambda: self.config["settings"].update({"send_delay": self.delay_spin.value()}) or self.save_config())
-        
+        self.delay_spin.setRange(0, 60)
+        self.delay_spin.setValue(settings_config.get("send_delay", 0))
+        self.delay_spin.setSingleStep(0.5)
+        self.delay_spin.valueChanged.connect(
+            lambda: self.config["settings"].update({"send_delay": self.delay_spin.value()}) or self.save_config()
+        )
+
         self.random_delay_spin = QDoubleSpinBox()
-        self.random_delay_spin.setRange(0, 30); self.random_delay_spin.setValue(settings_config.get("random_delay", 0)); self.random_delay_spin.setSingleStep(0.5)
-        self.random_delay_spin.valueChanged.connect(lambda: self.config["settings"].update({"random_delay": self.random_delay_spin.value()}) or self.save_config())
-        
+        self.random_delay_spin.setRange(0, 30)
+        self.random_delay_spin.setValue(settings_config.get("random_delay", 0))
+        self.random_delay_spin.setSingleStep(0.5)
+        self.random_delay_spin.valueChanged.connect(
+            lambda: self.config["settings"].update({"random_delay": self.random_delay_spin.value()})
+            or self.save_config()
+        )
+
         delay_layout = QHBoxLayout()
-        delay_layout.addWidget(QLabel("基础延迟(分):")); delay_layout.addWidget(self.delay_spin)
-        delay_layout.addWidget(QLabel("随机浮动(分):")); delay_layout.addWidget(self.random_delay_spin)
+        delay_layout.addWidget(QLabel("基础延迟(分):"))
+        delay_layout.addWidget(self.delay_spin)
+        delay_layout.addWidget(QLabel("随机浮动(分):"))
+        delay_layout.addWidget(self.random_delay_spin)
         time_layout.addRow(delay_layout)
 
         start_hbox = QHBoxLayout()
-        self.start_hour = QSpinBox(); self.start_hour.setRange(0, 23); self.start_hour.setValue(settings_config.get("auto_start_hour", 10))
-        self.start_minute = QSpinBox(); self.start_minute.setRange(0, 59); self.start_minute.setValue(settings_config.get("auto_start_minute", 0))
-        self.end_hour = QSpinBox(); self.end_hour.setRange(0, 23); self.end_hour.setValue(settings_config.get("auto_end_hour", 12))
-        self.end_minute = QSpinBox(); self.end_minute.setRange(0, 59); self.end_minute.setValue(settings_config.get("auto_end_minute", 0))
-        
-        def update_time():
-            self.config["settings"].update({"auto_start_hour": self.start_hour.value(), "auto_start_minute": self.start_minute.value(), "auto_end_hour": self.end_hour.value(), "auto_end_minute": self.end_minute.value()})
-            self.save_config()
-            
-        for w in [self.start_hour, self.start_minute, self.end_hour, self.end_minute]: w.valueChanged.connect(update_time)
+        self.start_hour = QSpinBox()
+        self.start_hour.setRange(0, 23)
+        self.start_hour.setValue(settings_config.get("auto_start_hour", 10))
+        self.start_minute = QSpinBox()
+        self.start_minute.setRange(0, 59)
+        self.start_minute.setValue(settings_config.get("auto_start_minute", 0))
+        self.end_hour = QSpinBox()
+        self.end_hour.setRange(0, 23)
+        self.end_hour.setValue(settings_config.get("auto_end_hour", 12))
+        self.end_minute = QSpinBox()
+        self.end_minute.setRange(0, 59)
+        self.end_minute.setValue(settings_config.get("auto_end_minute", 0))
 
-        start_hbox.addWidget(QLabel("每日开始:")); start_hbox.addWidget(self.start_hour); start_hbox.addWidget(QLabel("时")); start_hbox.addWidget(self.start_minute); start_hbox.addWidget(QLabel("分"))
-        start_hbox.addWidget(QLabel(" | 结束:")); start_hbox.addWidget(self.end_hour); start_hbox.addWidget(QLabel("时")); start_hbox.addWidget(self.end_minute); start_hbox.addWidget(QLabel("分"))
+        def update_time():
+            self.config["settings"].update(
+                {
+                    "auto_start_hour": self.start_hour.value(),
+                    "auto_start_minute": self.start_minute.value(),
+                    "auto_end_hour": self.end_hour.value(),
+                    "auto_end_minute": self.end_minute.value(),
+                }
+            )
+            self.save_config()
+
+        for widget in [self.start_hour, self.start_minute, self.end_hour, self.end_minute]:
+            widget.valueChanged.connect(update_time)
+
+        start_hbox.addWidget(QLabel("每日开始:"))
+        start_hbox.addWidget(self.start_hour)
+        start_hbox.addWidget(QLabel("时"))
+        start_hbox.addWidget(self.start_minute)
+        start_hbox.addWidget(QLabel("分"))
+        start_hbox.addWidget(QLabel(" | 结束:"))
+        start_hbox.addWidget(self.end_hour)
+        start_hbox.addWidget(QLabel("时"))
+        start_hbox.addWidget(self.end_minute)
+        start_hbox.addWidget(QLabel("分"))
         time_layout.addRow(start_hbox)
 
         self.enable_auto_timer = QCheckBox("启用每日定时自动启停监控")
         self.enable_auto_timer.setChecked(settings_config.get("enable_auto_timer", False))
+
         def toggle_auto_timer(state):
-            self.config["settings"]["enable_auto_timer"] = (state == Qt.Checked)
+            self.config["settings"]["enable_auto_timer"] = state == Qt.Checked
             self.save_config()
-            if state == Qt.Checked: self.start_auto_timer_check()
-            else: self.stop_auto_timer_check()
+            if state == Qt.Checked:
+                self.start_auto_timer_check()
+            else:
+                self.stop_auto_timer_check()
+
         self.enable_auto_timer.stateChanged.connect(toggle_auto_timer)
         time_layout.addRow(self.enable_auto_timer)
-        
+
         time_group.setLayout(time_layout)
         main_layout.addWidget(time_group)
+        main_layout.addStretch()
 
         return main_layout
+
+    def init_status_panel(self):
+        status_group = QWidget()
+        status_group.setObjectName("sidePanel")
+        layout = QVBoxLayout(status_group)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+        rows = [
+            ("monitor", "监控状态", "未启动"),
+            ("target", "目标窗口", "未检查"),
+            ("last_message", "最后消息", "-"),
+            ("last_trigger", "最近触发", "-"),
+            ("delay", "延时发送", "空闲"),
+            ("send_result", "发送结果", "-"),
+        ]
+        for key, label, value in rows:
+            card = QWidget()
+            card.setObjectName("statusCard")
+            card_layout = QVBoxLayout(card)
+            card_layout.setContentsMargins(12, 9, 12, 9)
+            card_layout.setSpacing(4)
+            title_label = QLabel(label)
+            title_label.setObjectName("statusTitle")
+            value_label = QLabel(value)
+            value_label.setWordWrap(True)
+            value_label.setObjectName("statusValue")
+            self.status_labels[key] = value_label
+            card_layout.addWidget(title_label)
+            card_layout.addWidget(value_label)
+            layout.addWidget(card)
+
+        layout.addStretch()
+        return status_group
 
     def init_monitor_log(self):
         vbox = QVBoxLayout()
@@ -359,35 +579,123 @@ class MomoReplyGUI(QWidget):
 
     def export_logs(self, manual=False):
         if self.log_view.count() == 0:
-            if manual: QMessageBox.information(self, "提示", "当前没有日志可以导出。")
+            if manual:
+                QMessageBox.information(self, "提示", "当前没有日志可以导出。")
             return
-        log_dir = "logs"
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(log_dir, f"momo_log_{timestamp}.txt")
+        filename = self.logs_dir / f"momo_log_{timestamp}.txt"
         try:
-            with open(filename, "w", encoding="utf-8") as f:
+            with filename.open("w", encoding="utf-8") as handle:
                 for i in range(self.log_view.count()):
-                    f.write(self.log_view.item(i).text() + "\n")
+                    handle.write(self.log_view.item(i).text() + "\n")
             self.log_view.clear()
-            msg = f"已将历史日志保存至 {filename} 并释放内存"
-            self.add_log(f"🧹 {msg}")
-            if manual: QMessageBox.information(self, "清理成功", msg)
-        except Exception as e:
-            if manual: QMessageBox.warning(self, "导出失败", str(e))
+            msg = f"已将面板日志保存至 {filename}"
+            self.add_log(msg)
+            if manual:
+                QMessageBox.information(self, "清理成功", msg)
+        except Exception as exc:
+            if manual:
+                QMessageBox.warning(self, "导出失败", str(exc))
 
     def add_log(self, message):
-        self.add_log_signal.emit(message)
+        self.add_log_signal.emit(str(message))
 
     def _do_add_log(self, message):
         current_time = time.strftime("%H:%M:%S")
-        self.log_view.addItem(f"[{current_time}] {message}")
+        line = f"[{current_time}] {message}"
+        self.log_view.addItem(line)
         self.log_view.scrollToBottom()
+        self.write_persistent_log(line)
         if self.log_view.count() > 300:
             self.export_logs(manual=False)
 
-    # [新增] 接收到子线程刷新信号后，主线程安全地更新图片数量显示
+    def write_persistent_log(self, line):
+        try:
+            self.logs_dir.mkdir(parents=True, exist_ok=True)
+            self.rotate_app_log_if_needed()
+            with self.app_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{datetime.datetime.now():%Y-%m-%d} {line}\n")
+        except Exception:
+            pass
+
+    def rotate_app_log_if_needed(self):
+        if self.app_log_path.exists() and self.app_log_path.stat().st_size > 2 * 1024 * 1024:
+            archive = self.logs_dir / f"app_{time.strftime('%Y%m%d_%H%M%S')}.log"
+            self.app_log_path.replace(archive)
+
+        cutoff = time.time() - 7 * 24 * 60 * 60
+        for path in self.logs_dir.glob("app_*.log"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except Exception:
+                pass
+
+    def set_status(self, key, value):
+        self.status_signal.emit(key, str(value))
+
+    def _do_update_status(self, key, value):
+        label = self.status_labels.get(key)
+        if label is not None:
+            label.setText(value)
+
+    def start_status_timer(self):
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self.refresh_runtime_status)
+        self.status_timer.start(3000)
+        self.refresh_runtime_status()
+
+    def refresh_runtime_status(self):
+        self.set_status("monitor", "运行中" if self.monitoring else "未启动")
+        target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
+        result = self.wechat.check_target_window(target_name)
+        self.set_status("target", result.message)
+
+    def run_startup_check(self):
+        self.add_log("开始启动自检")
+        for note in self.config_load_notes:
+            self.add_log(note)
+
+        dependency_checks = [
+            ("PyQt5", "PyQt5"),
+            ("uiautomation", "uiautomation"),
+            ("pyperclip", "pyperclip"),
+            ("pywin32/win32clipboard", "win32clipboard"),
+        ]
+        for name, module_name in dependency_checks:
+            try:
+                __import__(module_name)
+                self.add_log(f"依赖正常: {name}")
+            except Exception as exc:
+                self.add_log(f"依赖异常: {name} - {exc}")
+
+        self.add_log("请确认 Windows 讲述人模式已开启，否则微信控件可能无法识别")
+        target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
+        target_result = self.wechat.check_target_window(target_name)
+        self.set_status("target", target_result.message)
+        self.add_log(target_result.message)
+
+        active_count = self.config.get("settings", {}).get("active_rules_count", 1)
+        for index in range(active_count):
+            rule = self.config["rules"][index]
+            keywords = [item.strip() for item in rule.get("keywords", "").split(",") if item.strip()]
+            if not keywords:
+                self.add_log(f"规则 {index + 1} 未配置关键词")
+            if rule.get("reply_type") == "image":
+                folder = rule.get("folder", "").strip()
+                if not folder:
+                    self.add_log(f"规则 {index + 1} 未配置图片目录")
+                elif not os.path.isdir(folder):
+                    self.add_log(f"规则 {index + 1} 图片目录不存在: {folder}")
+                else:
+                    self.add_log(f"规则 {index + 1} 图片数量: {len(self.get_valid_images(folder))}")
+            else:
+                if not rule.get("reply_text", "").strip():
+                    self.add_log(f"规则 {index + 1} 未配置回复文本")
+
+        self.add_log("启动自检完成")
+
     def _do_update_img_count(self, rule_idx):
         if rule_idx in self.rule_img_count_labels:
             folder = self.config["rules"][rule_idx].get("folder", "")
@@ -427,7 +735,7 @@ class MomoReplyGUI(QWidget):
     def _find_matching_rule_index(self, clean_text, active_count):
         for i in range(active_count):
             rule = self.config["rules"][i]
-            keywords = [k.strip() for k in rule.get("keywords", "").split(',') if k.strip()]
+            keywords = [k.strip() for k in rule.get("keywords", "").split(",") if k.strip()]
             mode = rule.get("mode", "exact")
 
             if mode == "exact":
@@ -457,99 +765,40 @@ class MomoReplyGUI(QWidget):
         settings_config = self.config.get("settings", {})
         trigger_sender = settings_config.get("trigger_sender", "momo")
         active_count = settings_config.get("active_rules_count", 1)
-        
+
         clean_text = str(last_text).strip()
+        self.set_status("last_message", clean_text or "-")
         matched_rule_idx = self._find_matching_rule_index(clean_text, active_count)
-        
+
         if matched_rule_idx != -1:
             trigger_token = self._try_activate_trigger()
             if trigger_token is None:
                 return
-            
-            self.add_log(f"🚨 【警报触发】命中规则 {matched_rule_idx+1}，内容: '{last_text}'")
-            
+
+            trigger_text = f"规则 {matched_rule_idx + 1}: {last_text}"
+            self.set_status("last_trigger", trigger_text)
+            self.add_log(f"警报触发: 命中规则 {matched_rule_idx + 1}, 内容: '{last_text}'")
+
             delay_seconds, actual_delay = self._get_delay_seconds(settings_config)
-            
+
             if delay_seconds > 0:
-                self.add_log(f"⏳ 延迟 {actual_delay:.1f} 分钟后开始发送...")
-                
-                # 传入命中的 rule_idx
-                def _legacy_delayed_send_unused(rule_idx):
-                    import ctypes
-                    ctypes.windll.ole32.CoInitialize(None)
-                    wait_time = delay_seconds
-                    while wait_time > 0:
-                        if not self.monitoring:
-                            self.add_log("⏹️ 监控已停止，取消发送")
-                            self.last_triggered = False
-                            ctypes.windll.ole32.CoUninitialize()
-                            return
-                        time.sleep(1)
-                        wait_time -= 1
-                    if self.monitoring:
-                        # 执行实际发送
-                        self._do_send_action(trigger_sender, rule_idx)
-                    ctypes.windll.ole32.CoUninitialize()
-                        
+                self.add_log(f"延迟 {actual_delay:.1f} 分钟后开始发送")
                 threading.Thread(
                     target=self._delayed_send_action,
                     args=(delay_seconds, trigger_sender, matched_rule_idx, trigger_token),
-                    daemon=True
+                    daemon=True,
                 ).start()
             else:
                 self._do_send_action(trigger_sender, matched_rule_idx, trigger_token)
-                
-        elif self._clear_trigger_if_active():
-            self.add_log(f"✅ 警报解除：最后一条消息变成了: '{last_text}'。")
-    
-    # [重构] 包含图片和文本的处理中心
-    # Legacy implementation kept for reference; actual sends use _do_send_action below.
-    def _do_send_action_legacy(self, trigger_sender, rule_idx, trigger_token):
-        if not self._is_trigger_active(trigger_token):
-            self.add_log("当前触发已失效，跳过发送")
-            return
 
-        rule = self.config["rules"][rule_idx]
-        reply_type = rule.get("reply_type", "image")
-        
-        self.add_log(f"📡 开始执行发送机制...")
-        
-        try:
-            if reply_type == "image":
-                material_folder = rule.get("folder", "")
-                images = self.get_valid_images(material_folder)
-                
-                if len(images) == 0:
-                    self.add_log("❌ 指定素材文件夹中没有图片可发")
-                    return
-                
-                selected_image = random.choice(images)
-                self.add_log(f"🎲 已抽取图片: {os.path.basename(selected_image)}")
-                
-                self.wechat.send_file(trigger_sender, selected_image, search_user=False)
-                self.add_log(f"📤 图片发送成功")
-                
-                # 发送完就移除
-                os.remove(selected_image)
-                self.add_log(f"🗑️ 已删除源文件: {os.path.basename(selected_image)}")
-                
-                # [核心] 向主线程发出信号，实时刷新对应的 UI 图片数量！
-                self.update_img_count_signal.emit(rule_idx)
-                
-            elif reply_type == "text":
-                reply_text = rule.get("reply_text", "")
-                if not reply_text:
-                    self.add_log("❌ 规则未配置回复文本，无法发送")
-                    return
-                
-                self.add_log(f"📝 准备发送文本...")
-                self.wechat.send_msg(trigger_sender, text=reply_text, search_user=False)
-                self.add_log(f"📤 文本发送成功")
-                
-        except Exception as e:
-            self.add_log(f"❌ 发送异常: {str(e)}")
-        finally:
-            self._finish_trigger(trigger_token)
+        elif self._clear_trigger_if_active():
+            self.set_status("last_trigger", "已解除")
+            self.set_status("delay", "空闲")
+            self.add_log(f"警报解除: 最后一条消息变成了: '{last_text}'")
+
+    def _format_seconds(self, seconds):
+        minutes, sec = divmod(max(0, int(seconds)), 60)
+        return f"{minutes:02d}:{sec:02d}"
 
     def _delayed_send_action(self, delay_seconds, trigger_sender, rule_idx, trigger_token):
         _uia_init = auto.UIAutomationInitializerInThread()
@@ -557,21 +806,41 @@ class MomoReplyGUI(QWidget):
             wait_time = delay_seconds
             while wait_time > 0:
                 if not self.monitoring:
+                    self.set_status("delay", "已取消")
                     self.add_log("监控已停止，取消延时发送")
                     self._finish_trigger(trigger_token)
                     return
                 if not self._is_trigger_active(trigger_token):
+                    self.set_status("delay", "已取消")
                     self.add_log("警报已解除，取消本次延时发送")
                     return
+                self.set_status("delay", f"倒计时 {self._format_seconds(wait_time)}")
                 time.sleep(1)
                 wait_time -= 1
 
             if self.monitoring and self._is_trigger_active(trigger_token):
+                self.set_status("delay", "发送中")
                 self._do_send_action(trigger_sender, rule_idx, trigger_token)
             elif self.monitoring:
+                self.set_status("delay", "已取消")
                 self.add_log("警报已解除，取消本次延时发送")
         finally:
             _uia_init = None
+
+    def _move_to_sent_folder(self, image_path):
+        source = Path(image_path)
+        sent_dir = source.parent / "sent"
+        sent_dir.mkdir(parents=True, exist_ok=True)
+        destination = sent_dir / source.name
+        if destination.exists():
+            timestamp = time.strftime("%Y%m%d_%H%M%S")
+            destination = sent_dir / f"{source.stem}_{timestamp}{source.suffix}"
+            counter = 1
+            while destination.exists():
+                destination = sent_dir / f"{source.stem}_{timestamp}_{counter}{source.suffix}"
+                counter += 1
+        shutil.move(str(source), str(destination))
+        return destination
 
     def _do_send_action(self, trigger_sender, rule_idx, trigger_token):
         if not self._is_trigger_active(trigger_token):
@@ -580,7 +849,6 @@ class MomoReplyGUI(QWidget):
 
         rule = self.config["rules"][rule_idx]
         reply_type = rule.get("reply_type", "image")
-
         self.add_log("开始执行发送动作")
 
         try:
@@ -589,83 +857,100 @@ class MomoReplyGUI(QWidget):
                 images = self.get_valid_images(material_folder)
 
                 if len(images) == 0:
+                    self.set_status("send_result", "失败: 没有可发送图片")
                     self.add_log("指定素材文件夹中没有图片可发")
                     return
 
                 selected_image = random.choice(images)
                 self.add_log(f"已抽取图片: {os.path.basename(selected_image)}")
 
-                sent = self.wechat.send_file(trigger_sender, selected_image, search_user=False)
-                if not sent:
-                    self.add_log("图片发送动作未成功执行，已保留源文件")
+                result = self.wechat.send_file(trigger_sender, selected_image)
+                if not result:
+                    self.set_status("send_result", f"失败: {result.message}")
+                    self.add_log(f"图片发送失败: {result.message}")
                     return
 
-                self.add_log("图片发送动作已执行")
-                os.remove(selected_image)
-                self.add_log(f"已删除源文件: {os.path.basename(selected_image)}")
+                moved_path = self._move_to_sent_folder(selected_image)
+                self.set_status("send_result", result.message)
+                self.add_log(f"图片发送成功: {result.message}")
+                self.add_log(f"已移动到已发送目录: {moved_path}")
                 self.update_img_count_signal.emit(rule_idx)
 
             elif reply_type == "text":
                 reply_text = rule.get("reply_text", "")
                 if not reply_text:
+                    self.set_status("send_result", "失败: 未配置回复文本")
                     self.add_log("规则未配置回复文本，无法发送")
                     return
 
                 self.add_log("准备发送文本")
-                sent = self.wechat.send_msg(trigger_sender, text=reply_text, search_user=False)
-                if not sent:
-                    self.add_log("文本发送动作未成功执行")
+                result = self.wechat.send_msg(trigger_sender, text=reply_text)
+                if not result:
+                    self.set_status("send_result", f"失败: {result.message}")
+                    self.add_log(f"文本发送失败: {result.message}")
                     return
 
-                self.add_log("文本发送动作已执行")
+                self.set_status("send_result", result.message)
+                self.add_log(f"文本发送成功: {result.message}")
 
-        except Exception as e:
-            self.add_log(f"发送异常: {str(e)}")
+        except Exception as exc:
+            self.set_status("send_result", f"异常: {exc}")
+            self.add_log(f"发送异常: {exc}")
         finally:
+            self.set_status("delay", "空闲")
             self._finish_trigger(trigger_token)
 
     def start_monitoring(self):
         if self.monitoring:
-            QMessageBox.information(self, "提示", "监控已经在运行中！")
+            QMessageBox.information(self, "提示", "监控已经在运行中")
             return
-        
+
         start_time = time.strftime("%Y-%m-%d %H:%M:%S")
-        self.add_log(f"🚀 [{start_time}] 启动精准多重规则监控")
-        
+        self.add_log(f"[{start_time}] 启动精准多重规则监控")
+
         self._invalidate_trigger()
         trigger_sender = self.config.get("settings", {}).get("trigger_sender", "momo")
-        self.wechat.start_last_message_monitor(target_name=trigger_sender, callback=self.on_last_message_change, check_interval=1)
-        
+        result = self.wechat.start_last_message_monitor(
+            target_name=trigger_sender,
+            callback=self.on_last_message_change,
+            check_interval=1,
+            status_callback=lambda message: self.status_signal.emit("target", message),
+        )
+
+        if not result:
+            self.add_log(result.message)
+            return
+
         self.monitoring = True
+        self.set_status("monitor", "运行中")
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        self.start_btn.setStyleSheet("color:gray")
-        self.stop_btn.setStyleSheet("color:red")
-        
+
     def stop_monitoring(self):
         if self.monitoring:
-            self.wechat.stop_last_message_monitor()
+            result = self.wechat.stop_last_message_monitor()
             self._invalidate_trigger()
-            self.add_log(f"⏹️ 消息监控已手动停止")
+            self.add_log(result.message)
+            self.add_log("消息监控已手动停止")
             self.monitoring = False
+            self.set_status("monitor", "未启动")
+            self.set_status("delay", "空闲")
             self.start_btn.setEnabled(True)
             self.stop_btn.setEnabled(False)
-            self.start_btn.setStyleSheet("color:green")
-            self.stop_btn.setStyleSheet("color:gray")
-    
+
     def start_auto_timer_check(self):
         if self.auto_timer is None:
             self.auto_timer = QTimer(self)
             self.auto_timer.timeout.connect(self.auto_check_time)
             self.auto_timer.start(60000)
-            self.add_log("⏰ 自动定时启停检查已就绪")
-    
+            self.add_log("自动定时启停检查已就绪")
+
     def stop_auto_timer_check(self):
         if self.auto_timer is not None:
             self.auto_timer.stop()
             self.auto_timer = None
-            self.add_log("⏹️ 自动定时启停已被关闭")
-    
+            self.add_log("自动定时启停已被关闭")
+
     def auto_check_time(self):
         now = datetime.datetime.now()
         settings_config = self.config.get("settings", {})
@@ -673,59 +958,211 @@ class MomoReplyGUI(QWidget):
         start_m = settings_config.get("auto_start_minute", 0)
         end_h = settings_config.get("auto_end_hour", 12)
         end_m = settings_config.get("auto_end_minute", 0)
-        
+
         current_total = now.hour * 60 + now.minute
         start_total = start_h * 60 + start_m
         end_total = end_h * 60 + end_m
         should_be_monitoring = start_total <= current_total < end_total
-        
+
         if should_be_monitoring and not self.monitoring:
-            self.add_log(f"🤖 到达设定区间，自动启动监控")
+            self.add_log("到达设定区间，自动启动监控")
             self.start_monitoring()
         elif not should_be_monitoring and self.monitoring:
-            self.add_log(f"🤖 离开设定区间，自动停止监控")
+            self.add_log("离开设定区间，自动停止监控")
             self.stop_monitoring()
 
+    def apply_app_style(self):
+        self.setStyleSheet(
+            """
+            QWidget {
+                font-size: 13px;
+                color: #172033;
+            }
+            QWidget#root {
+                background: #f3f6fa;
+            }
+            QWidget#sidePanel, QWidget#actionPanel {
+                background: #ffffff;
+                border: 1px solid #dce3ed;
+                border-radius: 12px;
+            }
+            QGroupBox {
+                font-weight: 600;
+                border: 1px solid #dce3ed;
+                border-radius: 12px;
+                margin-top: 14px;
+                padding: 16px 12px 12px 12px;
+                background: #ffffff;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 5px;
+                color: #344054;
+            }
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {
+                min-height: 32px;
+                border: 1px solid #cad4e0;
+                border-radius: 8px;
+                padding: 3px 10px;
+                background: #ffffff;
+            }
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {
+                border: 1px solid #16805a;
+            }
+            QPushButton {
+                min-height: 32px;
+                border: 1px solid #b8c2d0;
+                border-radius: 8px;
+                padding: 6px 12px;
+                background: #f8fafc;
+            }
+            QPushButton:hover {
+                background: #eef4f8;
+            }
+            QPushButton#primaryButton {
+                color: #ffffff;
+                background: #14724f;
+                border-color: #14724f;
+                font-weight: 700;
+                min-height: 42px;
+            }
+            QPushButton#dangerButton {
+                color: #ffffff;
+                background: #a33a2f;
+                border-color: #a33a2f;
+                font-weight: 700;
+                min-height: 42px;
+            }
+            QPushButton#secondaryButton {
+                background: #ffffff;
+                min-height: 36px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #dce3ed;
+                border-radius: 12px;
+                background: #ffffff;
+            }
+            QTabBar::tab {
+                padding: 10px 22px;
+                margin-right: 6px;
+                border-radius: 9px;
+                background: transparent;
+                color: #586475;
+            }
+            QTabBar::tab:selected {
+                background: #e8f2ee;
+                color: #124d38;
+                font-weight: 700;
+            }
+            QListWidget {
+                border: 1px solid #dce3ed;
+                border-radius: 12px;
+                background: #fbfcfe;
+                padding: 6px;
+            }
+            QWidget#statusCard {
+                background: #f8fafc;
+                border: 1px solid #e4eaf2;
+                border-radius: 10px;
+            }
+            QLabel#statusTitle {
+                color: #667085;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QLabel#statusValue {
+                color: #172033;
+                font-weight: 500;
+            }
+            QScrollArea {
+                border: none;
+                background: transparent;
+            }
+            """
+        )
+
     def initUI(self):
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        main_widget = QWidget()
-        vbox = QVBoxLayout(main_widget)
+        self.setObjectName("root")
+        self.apply_app_style()
 
-        lang = self.init_language_choose()
-        settings = self.init_settings()
-        monitor_log = self.init_monitor_log()
+        outer_layout = QHBoxLayout()
+        outer_layout.setContentsMargins(14, 14, 14, 14)
+        outer_layout.setSpacing(14)
 
-        hbox_controls = QHBoxLayout()
-        self.start_btn = QPushButton("▶ 开始监控")
-        self.start_btn.setStyleSheet("color:green; font-size: 14px; font-weight: bold; padding: 12px;")
+        sidebar = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(12)
+        sidebar.setFixedWidth(300)
+
+        action_panel = QWidget()
+        action_panel.setObjectName("actionPanel")
+        action_layout = QVBoxLayout(action_panel)
+        action_layout.setContentsMargins(12, 12, 12, 12)
+        action_layout.setSpacing(10)
+
+        check_btn = QPushButton("立即自检")
+        check_btn.setObjectName("secondaryButton")
+        check_btn.clicked.connect(self.run_startup_check)
+
+        self.start_btn = QPushButton("开始监控")
+        self.start_btn.setObjectName("primaryButton")
         self.start_btn.clicked.connect(self.start_monitoring)
-        
-        self.stop_btn = QPushButton("■ 停止监控")
-        self.stop_btn.setStyleSheet("color:gray; font-size: 14px; padding: 12px;")
+
+        self.stop_btn = QPushButton("停止监控")
+        self.stop_btn.setObjectName("dangerButton")
         self.stop_btn.setEnabled(False)
         self.stop_btn.clicked.connect(self.stop_monitoring)
-        
-        hbox_controls.addWidget(self.start_btn)
-        hbox_controls.addWidget(self.stop_btn)
 
-        vbox.addWidget(lang)
-        vbox.addLayout(settings)
-        vbox.addLayout(monitor_log)
-        vbox.addLayout(hbox_controls)
+        action_layout.addWidget(check_btn)
+        action_layout.addWidget(self.start_btn)
+        action_layout.addWidget(self.stop_btn)
 
-        scroll_area.setWidget(main_widget)
-        outer_layout = QVBoxLayout()
-        outer_layout.addWidget(scroll_area)
+        status_panel = self.init_status_panel()
+        sidebar_layout.addWidget(action_panel)
+        sidebar_layout.addWidget(status_panel, 1)
+
+        tabs = QTabWidget()
+        tabs.setDocumentMode(True)
+
+        config_scroll = QScrollArea()
+        config_scroll.setWidgetResizable(True)
+        config_scroll.setFrameShape(QScrollArea.NoFrame)
+        config_inner = QWidget()
+        config_layout = QVBoxLayout(config_inner)
+        config_layout.setContentsMargins(12, 12, 12, 12)
+        config_layout.setSpacing(10)
+        config_layout.addWidget(self.init_language_choose())
+        config_layout.addLayout(self.init_settings())
+        config_layout.addStretch()
+        config_scroll.setWidget(config_inner)
+        tabs.addTab(config_scroll, "规则配置")
+
+        schedule_page = QWidget()
+        schedule_layout = QVBoxLayout(schedule_page)
+        schedule_layout.setContentsMargins(12, 12, 12, 12)
+        schedule_layout.addLayout(self.init_time_settings())
+        tabs.addTab(schedule_page, "定时设置")
+
+        log_page = QWidget()
+        log_layout = QVBoxLayout(log_page)
+        log_layout.setContentsMargins(12, 12, 12, 12)
+        log_layout.addLayout(self.init_monitor_log())
+        tabs.addTab(log_page, "日志")
+
+        outer_layout.addWidget(sidebar)
+        outer_layout.addWidget(tabs, 1)
 
         desktop = QApplication.desktop()
-        screenRect = desktop.screenGeometry()
+        screen_rect = desktop.screenGeometry()
         self.setLayout(outer_layout)
-        self.resize(int(screenRect.width() * 0.4), int(screenRect.height() * 0.8))
-        self.setWindowTitle('EasyChat 规则自定化发图机器人 (增强版)')
+        self.resize(int(screen_rect.width() * 0.55), int(screen_rect.height() * 0.82))
+        self.setWindowTitle("微信自动回复助手")
         self.show()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     app = QApplication(sys.argv)
     ex = MomoReplyGUI()
     sys.exit(app.exec_())
