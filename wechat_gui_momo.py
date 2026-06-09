@@ -10,6 +10,69 @@ import threading
 import time
 from pathlib import Path
 
+# Keep Qt controls sharp and correctly sized on 4K/high-DPI displays while
+# still allowing users to override Qt scaling with their own environment.
+os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
+os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
+
+
+def is_running_as_admin():
+    if os.name != "nt":
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    if os.name != "nt":
+        return False
+
+    if getattr(sys, "frozen", False):
+        executable = sys.executable
+        params = subprocess.list2cmdline(sys.argv[1:])
+    else:
+        executable = sys.executable
+        script = str(Path(sys.argv[0]).resolve())
+        params = subprocess.list2cmdline([script, *sys.argv[1:]])
+
+    try:
+        result = ctypes.windll.shell32.ShellExecuteW(
+            None,
+            "runas",
+            executable,
+            params,
+            str(Path.cwd()),
+            1,
+        )
+    except Exception:
+        return False
+    return result > 32
+
+
+def show_admin_launch_error():
+    message = "EasyChat Momo needs administrator permission to start."
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "EasyChat Momo", 0x10)
+    except Exception:
+        print(message, file=sys.stderr)
+
+
+def ensure_admin_or_exit():
+    if os.name != "nt" or is_running_as_admin():
+        return
+    if relaunch_as_admin():
+        sys.exit(0)
+    show_admin_launch_error()
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    ensure_admin_or_exit()
+
+
 import uiautomation as auto
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -29,6 +92,7 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -42,11 +106,12 @@ from wechat_locale import WeChatLocale
 class MomoReplyGUI(QWidget):
     add_log_signal = pyqtSignal(str)
     update_img_count_signal = pyqtSignal(int)
+    update_scheduled_img_count_signal = pyqtSignal()
     status_signal = pyqtSignal(str, str)
 
     def __init__(self):
         super().__init__()
-        self.base_dir = Path(__file__).resolve().parent
+        self.base_dir = self.get_app_base_dir()
         self.config_path = self.base_dir / "wechat_config_momo.json"
         self.logs_dir = self.base_dir / "logs"
         self.app_log_path = self.logs_dir / "app.log"
@@ -60,12 +125,18 @@ class MomoReplyGUI(QWidget):
         self.trigger_state_lock = threading.Lock()
         self.trigger_token = 0
         self.auto_timer = None
+        self.scheduled_image_timer = None
+        self.scheduled_image_next_at = None
+        self.scheduled_image_sending = False
         self.status_timer = None
         self.rule_img_count_labels = {}
+        self.scheduled_img_count_label = None
+        self.scheduled_folder_input = None
         self.status_labels = {}
 
         self.add_log_signal.connect(self._do_add_log)
         self.update_img_count_signal.connect(self._do_update_img_count)
+        self.update_scheduled_img_count_signal.connect(self._do_update_scheduled_img_count)
         self.status_signal.connect(self._do_update_status)
 
         self.initUI()
@@ -74,9 +145,17 @@ class MomoReplyGUI(QWidget):
         if self.config.get("settings", {}).get("enable_auto_timer", False):
             self.enable_auto_timer.setChecked(True)
             self.start_auto_timer_check()
+        if self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
+            self.enable_scheduled_image_sender.setChecked(True)
+            self.start_scheduled_image_sender()
 
         self.show_wechat_open_notice()
         QTimer.singleShot(100, self.run_startup_check)
+
+    def get_app_base_dir(self):
+        if getattr(sys, "frozen", False):
+            return Path(sys.executable).resolve().parent
+        return Path(__file__).resolve().parent
 
     def default_config(self):
         return {
@@ -86,6 +165,16 @@ class MomoReplyGUI(QWidget):
                 "active_rules_count": 1,
                 "send_delay": 2.0,
                 "random_delay": 0,
+                "enable_scheduled_image_sender": False,
+                "scheduled_image_folder": "",
+                "scheduled_image_start_hour": 9,
+                "scheduled_image_start_minute": 0,
+                "scheduled_image_start_random_window_minutes": 30,
+                "scheduled_image_min_lead_minutes": 10,
+                "scheduled_image_end_hour": 23,
+                "scheduled_image_end_minute": 0,
+                "scheduled_image_interval_minutes": 60,
+                "scheduled_image_random_window_minutes": 15,
             },
             "rules": [
                 {"keywords": "!,！", "reply_type": "image", "folder": "", "reply_text": "", "mode": "exact"},
@@ -158,6 +247,33 @@ class MomoReplyGUI(QWidget):
             settings["active_rules_count"] = active_count
             changed = True
 
+        numeric_ranges = {
+            "scheduled_image_start_hour": (0, 23, 9),
+            "scheduled_image_start_minute": (0, 59, 0),
+            "scheduled_image_start_random_window_minutes": (0, 720, 30),
+            "scheduled_image_min_lead_minutes": (0, 120, 10),
+            "scheduled_image_end_hour": (0, 23, 23),
+            "scheduled_image_end_minute": (0, 59, 0),
+            "scheduled_image_interval_minutes": (1, 1440, 60),
+            "scheduled_image_random_window_minutes": (0, 720, 15),
+        }
+        for key, (minimum, maximum, default) in numeric_ranges.items():
+            try:
+                value = int(settings.get(key, default))
+            except (TypeError, ValueError):
+                value = default
+            value = max(minimum, min(maximum, value))
+            if settings.get(key) != value:
+                settings[key] = value
+                changed = True
+
+        if not isinstance(settings.get("enable_scheduled_image_sender"), bool):
+            settings["enable_scheduled_image_sender"] = bool(settings.get("enable_scheduled_image_sender"))
+            changed = True
+        if not isinstance(settings.get("scheduled_image_folder"), str):
+            settings["scheduled_image_folder"] = ""
+            changed = True
+
         rules = config.setdefault("rules", [])
         if not isinstance(rules, list):
             rules = []
@@ -190,21 +306,114 @@ class MomoReplyGUI(QWidget):
         return changed
 
     def save_config(self):
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
         with self.config_path.open("w", encoding="utf-8") as handle:
             json.dump(self.config, handle, indent=4, ensure_ascii=False)
 
+    def sync_scheduled_image_settings_from_ui(self, save=True):
+        settings = self.config.setdefault("settings", {})
+        if self.scheduled_folder_input is not None:
+            settings["scheduled_image_folder"] = self.scheduled_folder_input.text().strip()
+        if hasattr(self, "scheduled_start_hour"):
+            settings.update(
+                {
+                    "scheduled_image_start_hour": self.scheduled_start_hour.value(),
+                    "scheduled_image_start_minute": self.scheduled_start_minute.value(),
+                    "scheduled_image_start_random_window_minutes": self.scheduled_start_random_spin.value(),
+                    "scheduled_image_min_lead_minutes": self.scheduled_min_lead_spin.value(),
+                    "scheduled_image_end_hour": self.scheduled_end_hour.value(),
+                    "scheduled_image_end_minute": self.scheduled_end_minute.value(),
+                }
+            )
+        if hasattr(self, "scheduled_interval_spin"):
+            settings.update(
+                {
+                    "scheduled_image_interval_minutes": self.scheduled_interval_spin.value(),
+                    "scheduled_image_random_window_minutes": self.scheduled_random_spin.value(),
+                }
+            )
+        if hasattr(self, "enable_scheduled_image_sender"):
+            settings["enable_scheduled_image_sender"] = self.enable_scheduled_image_sender.isChecked()
+        if save:
+            self.save_config()
+
+    def normalize_folder_path(self, folder):
+        if not folder:
+            return ""
+        return os.path.expandvars(os.path.expanduser(str(folder).strip().strip('"')))
+
+    def _is_windows_drive_path(self, folder):
+        return os.name == "nt" and len(folder) >= 2 and folder[1] == ":"
+
+    def _mapped_drive_to_unc(self, folder):
+        if not self._is_windows_drive_path(folder):
+            return ""
+        try:
+            import winreg
+
+            drive_letter = folder[0].upper()
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, fr"Network\{drive_letter}") as key:
+                remote_path, _ = winreg.QueryValueEx(key, "RemotePath")
+        except Exception:
+            return ""
+
+        relative = folder[2:].lstrip("\\/")
+        return os.path.join(remote_path, relative) if relative else remote_path
+
+    def resolve_accessible_folder_path(self, folder):
+        folder = self.normalize_folder_path(folder)
+        if not folder:
+            return ""
+        if os.path.isdir(folder):
+            return folder
+
+        unc_path = self._mapped_drive_to_unc(folder)
+        if unc_path and os.path.isdir(unc_path):
+            return unc_path
+        return folder
+
+    def get_folder_access_message(self, folder):
+        folder = self.normalize_folder_path(folder)
+        if not folder:
+            return ""
+        if os.path.isdir(folder):
+            return ""
+
+        unc_path = self._mapped_drive_to_unc(folder)
+        if unc_path and os.path.isdir(unc_path):
+            return ""
+        if unc_path:
+            return f"目录不可访问: {folder}；已尝试映射到共享路径 {unc_path}，但仍无法读取。"
+        if self._is_windows_drive_path(folder):
+            return (
+                f"目录不可访问: {folder}。如果这是共享盘映射盘符，管理员模式可能看不到它；"
+                r"请改用 \\服务器\共享\目录 这样的 UNC 路径，或在管理员会话中重新映射该盘符。"
+            )
+        if folder.startswith("\\\\"):
+            return f"共享目录不可访问: {folder}。请确认网络连接、共享权限和账号访问权限。"
+        return f"目录不存在或不可访问: {folder}"
+
+    def image_count_text(self, folder):
+        problem = self.get_folder_access_message(folder)
+        if problem:
+            return "图片数量: 目录不可访问"
+        return f"图片数量: {len(self.get_valid_images(folder))}"
+
     def get_valid_images(self, folder):
-        if not folder or not os.path.exists(folder):
+        folder = self.resolve_accessible_folder_path(folder)
+        if not folder or not os.path.isdir(folder):
             return []
         image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
         images = []
-        for file in os.listdir(folder):
-            path = os.path.join(folder, file)
-            if not os.path.isfile(path):
-                continue
-            ext = os.path.splitext(file)[1].lower()
-            if ext in image_extensions:
-                images.append(path)
+        try:
+            for entry in os.scandir(folder):
+                if not entry.is_file():
+                    continue
+                ext = os.path.splitext(entry.name)[1].lower()
+                if ext in image_extensions:
+                    images.append(entry.path)
+        except OSError:
+            return []
         return images
 
     def closeEvent(self, event):
@@ -212,6 +421,8 @@ class MomoReplyGUI(QWidget):
             self.stop_monitoring()
         if self.auto_timer is not None:
             self.stop_auto_timer_check()
+        if self.scheduled_image_timer is not None:
+            self.stop_scheduled_image_sender()
         if self.status_timer is not None:
             self.status_timer.stop()
         QApplication.quit()
@@ -350,7 +561,7 @@ class MomoReplyGUI(QWidget):
 
             def make_folder_browser(idx, f_input, f_info):
                 def browse():
-                    current_folder = f_input.text().strip()
+                    current_folder = self.resolve_accessible_folder_path(f_input.text().strip())
                     if not os.path.isdir(current_folder):
                         desktop_folder = Path.home() / "Desktop"
                         current_folder = str(desktop_folder if desktop_folder.exists() else Path.home())
@@ -358,7 +569,6 @@ class MomoReplyGUI(QWidget):
                     dialog = QFileDialog(self, f"选择规则 {idx + 1} 的图片素材目录")
                     dialog.setFileMode(QFileDialog.Directory)
                     dialog.setOption(QFileDialog.ShowDirsOnly, True)
-                    dialog.setOption(QFileDialog.DontUseNativeDialog, True)
                     dialog.setDirectory(current_folder)
 
                     if dialog.exec_() != QFileDialog.Accepted:
@@ -372,16 +582,14 @@ class MomoReplyGUI(QWidget):
                     f_input.setText(folder)
                     self.config["rules"][idx]["folder"] = folder
                     self.save_config()
-                    imgs = self.get_valid_images(folder)
-                    f_info.setText(f"图片数量: {len(imgs)}")
+                    f_info.setText(self.image_count_text(folder))
                     self.add_log(f"规则 {idx + 1} 图片目录已选择: {folder}")
                 return browse
 
             def update_count(idx, f_input, f_info):
                 self.config["rules"][idx]["folder"] = f_input.text().strip()
                 self.save_config()
-                imgs = self.get_valid_images(f_input.text().strip())
-                f_info.setText(f"图片数量: {len(imgs)}")
+                f_info.setText(self.image_count_text(f_input.text().strip()))
 
             def update_text(idx, edit):
                 self.config["rules"][idx]["reply_text"] = edit.text()
@@ -440,11 +648,11 @@ class MomoReplyGUI(QWidget):
 
         return main_layout
 
-    def init_time_settings(self):
+    def init_keyword_timing_settings(self):
         settings_config = self.config.get("settings", {})
         main_layout = QVBoxLayout()
 
-        time_group = QGroupBox("延迟及自动启停")
+        time_group = QGroupBox("回复延迟与监控时段")
         time_layout = QFormLayout()
 
         self.delay_spin = QDoubleSpinBox()
@@ -504,12 +712,17 @@ class MomoReplyGUI(QWidget):
         start_hbox.addWidget(QLabel("时"))
         start_hbox.addWidget(self.start_minute)
         start_hbox.addWidget(QLabel("分"))
-        start_hbox.addWidget(QLabel(" | 结束:"))
-        start_hbox.addWidget(self.end_hour)
-        start_hbox.addWidget(QLabel("时"))
-        start_hbox.addWidget(self.end_minute)
-        start_hbox.addWidget(QLabel("分"))
+        start_hbox.addStretch()
         time_layout.addRow(start_hbox)
+
+        end_hbox = QHBoxLayout()
+        end_hbox.addWidget(QLabel("每日结束:"))
+        end_hbox.addWidget(self.end_hour)
+        end_hbox.addWidget(QLabel("时"))
+        end_hbox.addWidget(self.end_minute)
+        end_hbox.addWidget(QLabel("分"))
+        end_hbox.addStretch()
+        time_layout.addRow(end_hbox)
 
         self.enable_auto_timer = QCheckBox("启用每日定时自动启停监控")
         self.enable_auto_timer.setChecked(settings_config.get("enable_auto_timer", False))
@@ -531,6 +744,180 @@ class MomoReplyGUI(QWidget):
 
         return main_layout
 
+    def init_scheduled_image_settings(self):
+        settings_config = self.config.get("settings", {})
+        main_layout = QVBoxLayout()
+
+        scheduled_group = QGroupBox("发送素材")
+        scheduled_layout = QFormLayout()
+
+        scheduled_folder_w = QWidget()
+        scheduled_folder_layout = QHBoxLayout(scheduled_folder_w)
+        scheduled_folder_layout.setContentsMargins(0, 0, 0, 0)
+        scheduled_folder_input = QLineEdit(settings_config.get("scheduled_image_folder", ""))
+        self.scheduled_folder_input = scheduled_folder_input
+        scheduled_folder_input.setPlaceholderText("选择或粘贴定时发送的图片素材文件夹路径")
+        scheduled_folder_btn = QPushButton("选择目录")
+        scheduled_folder_btn.setFixedWidth(92)
+        scheduled_folder_layout.addWidget(scheduled_folder_input)
+        scheduled_folder_layout.addWidget(scheduled_folder_btn)
+        self.scheduled_img_count_label = QLabel("图片数量: 0")
+
+        def refresh_scheduled_count():
+            self.sync_scheduled_image_settings_from_ui()
+            folder = self.config.get("settings", {}).get("scheduled_image_folder", "")
+            self.scheduled_img_count_label.setText(self.image_count_text(folder))
+
+        def browse_scheduled_folder():
+            current_folder = self.resolve_accessible_folder_path(scheduled_folder_input.text().strip())
+            if not os.path.isdir(current_folder):
+                desktop_folder = Path.home() / "Desktop"
+                current_folder = str(desktop_folder if desktop_folder.exists() else Path.home())
+
+            dialog = QFileDialog(self, "选择定时发送图片素材目录")
+            dialog.setFileMode(QFileDialog.Directory)
+            dialog.setOption(QFileDialog.ShowDirsOnly, True)
+            dialog.setDirectory(current_folder)
+
+            if dialog.exec_() != QFileDialog.Accepted:
+                return
+
+            selected = dialog.selectedFiles()
+            if not selected:
+                return
+
+            folder = selected[0]
+            scheduled_folder_input.setText(folder)
+            refresh_scheduled_count()
+            self.add_log(f"定时发图素材目录已选择: {folder}")
+
+        scheduled_folder_btn.clicked.connect(browse_scheduled_folder)
+        scheduled_folder_input.editingFinished.connect(refresh_scheduled_count)
+        scheduled_layout.addRow("图片目录:", scheduled_folder_w)
+        scheduled_layout.addRow("", self.scheduled_img_count_label)
+
+        scheduled_group.setLayout(scheduled_layout)
+        main_layout.addWidget(scheduled_group)
+
+        scheduled_window_group = QGroupBox("发送窗口")
+        scheduled_window_layout = QFormLayout()
+
+        scheduled_start_hbox = QHBoxLayout()
+        self.scheduled_start_hour = QSpinBox()
+        self.scheduled_start_hour.setRange(0, 23)
+        self.scheduled_start_hour.setValue(settings_config.get("scheduled_image_start_hour", 9))
+        self.scheduled_start_minute = QSpinBox()
+        self.scheduled_start_minute.setRange(0, 59)
+        self.scheduled_start_minute.setValue(settings_config.get("scheduled_image_start_minute", 0))
+        self.scheduled_start_random_spin = QSpinBox()
+        self.scheduled_start_random_spin.setRange(0, 720)
+        self.scheduled_start_random_spin.setValue(
+            settings_config.get("scheduled_image_start_random_window_minutes", 30)
+        )
+        self.scheduled_min_lead_spin = QSpinBox()
+        self.scheduled_min_lead_spin.setRange(0, 120)
+        self.scheduled_min_lead_spin.setValue(settings_config.get("scheduled_image_min_lead_minutes", 10))
+        self.scheduled_end_hour = QSpinBox()
+        self.scheduled_end_hour.setRange(0, 23)
+        self.scheduled_end_hour.setValue(settings_config.get("scheduled_image_end_hour", 23))
+        self.scheduled_end_minute = QSpinBox()
+        self.scheduled_end_minute.setRange(0, 59)
+        self.scheduled_end_minute.setValue(settings_config.get("scheduled_image_end_minute", 0))
+
+        def update_scheduled_time():
+            self.sync_scheduled_image_settings_from_ui()
+            self.reset_scheduled_image_next_send()
+
+        for widget in [
+            self.scheduled_start_hour,
+            self.scheduled_start_minute,
+            self.scheduled_start_random_spin,
+            self.scheduled_min_lead_spin,
+            self.scheduled_end_hour,
+            self.scheduled_end_minute,
+        ]:
+            widget.valueChanged.connect(update_scheduled_time)
+
+        scheduled_start_hbox.addWidget(QLabel("首次发送:"))
+        scheduled_start_hbox.addWidget(self.scheduled_start_hour)
+        scheduled_start_hbox.addWidget(QLabel("时"))
+        scheduled_start_hbox.addWidget(self.scheduled_start_minute)
+        scheduled_start_hbox.addWidget(QLabel("分"))
+        scheduled_start_hbox.addStretch()
+        scheduled_window_layout.addRow(scheduled_start_hbox)
+
+        scheduled_start_random_hbox = QHBoxLayout()
+        scheduled_start_random_hbox.addWidget(QLabel("首次随机浮动(分):"))
+        scheduled_start_random_hbox.addWidget(self.scheduled_start_random_spin)
+        scheduled_start_random_hbox.addStretch()
+        scheduled_window_layout.addRow(scheduled_start_random_hbox)
+
+        scheduled_min_lead_hbox = QHBoxLayout()
+        scheduled_min_lead_hbox.addWidget(QLabel("启用后最短等待(分):"))
+        scheduled_min_lead_hbox.addWidget(self.scheduled_min_lead_spin)
+        scheduled_min_lead_hbox.addStretch()
+        scheduled_window_layout.addRow(scheduled_min_lead_hbox)
+
+        scheduled_end_hbox = QHBoxLayout()
+        scheduled_end_hbox.addWidget(QLabel("停止发送:"))
+        scheduled_end_hbox.addWidget(self.scheduled_end_hour)
+        scheduled_end_hbox.addWidget(QLabel("时"))
+        scheduled_end_hbox.addWidget(self.scheduled_end_minute)
+        scheduled_end_hbox.addWidget(QLabel("分"))
+        scheduled_end_hbox.addStretch()
+        scheduled_window_layout.addRow(scheduled_end_hbox)
+
+        scheduled_window_group.setLayout(scheduled_window_layout)
+        main_layout.addWidget(scheduled_window_group)
+
+        scheduled_interval_group = QGroupBox("循环发送")
+        scheduled_interval_layout = QFormLayout()
+
+        scheduled_interval_hbox = QHBoxLayout()
+        self.scheduled_interval_spin = QSpinBox()
+        self.scheduled_interval_spin.setRange(1, 1440)
+        self.scheduled_interval_spin.setValue(settings_config.get("scheduled_image_interval_minutes", 60))
+        self.scheduled_random_spin = QSpinBox()
+        self.scheduled_random_spin.setRange(0, 720)
+        self.scheduled_random_spin.setValue(settings_config.get("scheduled_image_random_window_minutes", 15))
+
+        def update_scheduled_interval():
+            self.sync_scheduled_image_settings_from_ui()
+            self.reset_scheduled_image_next_send()
+
+        self.scheduled_interval_spin.valueChanged.connect(update_scheduled_interval)
+        self.scheduled_random_spin.valueChanged.connect(update_scheduled_interval)
+        scheduled_interval_hbox.addWidget(QLabel("间隔(分):"))
+        scheduled_interval_hbox.addWidget(self.scheduled_interval_spin)
+        scheduled_interval_hbox.addStretch()
+        scheduled_interval_layout.addRow(scheduled_interval_hbox)
+
+        scheduled_random_hbox = QHBoxLayout()
+        scheduled_random_hbox.addWidget(QLabel("随机浮动(分):"))
+        scheduled_random_hbox.addWidget(self.scheduled_random_spin)
+        scheduled_random_hbox.addStretch()
+        scheduled_interval_layout.addRow(scheduled_random_hbox)
+
+        self.enable_scheduled_image_sender = QCheckBox("启用定时主动发送图片")
+        self.enable_scheduled_image_sender.setChecked(settings_config.get("enable_scheduled_image_sender", False))
+
+        def toggle_scheduled_image_sender(state):
+            self.sync_scheduled_image_settings_from_ui()
+            if state == Qt.Checked:
+                self.start_scheduled_image_sender()
+            else:
+                self.stop_scheduled_image_sender()
+
+        self.enable_scheduled_image_sender.stateChanged.connect(toggle_scheduled_image_sender)
+        scheduled_interval_layout.addRow(self.enable_scheduled_image_sender)
+
+        scheduled_interval_group.setLayout(scheduled_interval_layout)
+        main_layout.addWidget(scheduled_interval_group)
+        refresh_scheduled_count()
+        main_layout.addStretch()
+
+        return main_layout
+
     def init_status_panel(self):
         status_group = QWidget()
         status_group.setObjectName("sidePanel")
@@ -544,6 +931,7 @@ class MomoReplyGUI(QWidget):
             ("last_message", "最后消息", "-"),
             ("last_trigger", "最近触发", "-"),
             ("delay", "延时发送", "空闲"),
+            ("timed_send", "定时发图", "未启用"),
             ("send_result", "发送结果", "-"),
         ]
         for key, label, value in rows:
@@ -691,8 +1079,8 @@ class MomoReplyGUI(QWidget):
                 folder = rule.get("folder", "").strip()
                 if not folder:
                     self.add_log(f"规则 {index + 1} 未配置图片目录")
-                elif not os.path.isdir(folder):
-                    self.add_log(f"规则 {index + 1} 图片目录不存在: {folder}")
+                elif self.get_folder_access_message(folder):
+                    self.add_log(f"规则 {index + 1} {self.get_folder_access_message(folder)}")
                 else:
                     self.add_log(f"规则 {index + 1} 图片数量: {len(self.get_valid_images(folder))}")
             else:
@@ -704,8 +1092,12 @@ class MomoReplyGUI(QWidget):
     def _do_update_img_count(self, rule_idx):
         if rule_idx in self.rule_img_count_labels:
             folder = self.config["rules"][rule_idx].get("folder", "")
-            imgs = self.get_valid_images(folder)
-            self.rule_img_count_labels[rule_idx].setText(f"图片数量: {len(imgs)}")
+            self.rule_img_count_labels[rule_idx].setText(self.image_count_text(folder))
+
+    def _do_update_scheduled_img_count(self):
+        if self.scheduled_img_count_label is not None:
+            folder = self.config.get("settings", {}).get("scheduled_image_folder", "")
+            self.scheduled_img_count_label.setText(self.image_count_text(folder))
 
     def _try_activate_trigger(self):
         with self.trigger_state_lock:
@@ -859,6 +1251,12 @@ class MomoReplyGUI(QWidget):
         try:
             if reply_type == "image":
                 material_folder = rule.get("folder", "")
+                folder_problem = self.get_folder_access_message(material_folder)
+                if folder_problem:
+                    self.set_status("send_result", "失败: 图片目录不可访问")
+                    self.add_log(folder_problem)
+                    return
+
                 images = self.get_valid_images(material_folder)
 
                 if len(images) == 0:
@@ -976,6 +1374,223 @@ class MomoReplyGUI(QWidget):
             self.add_log("离开设定区间，自动停止监控")
             self.stop_monitoring()
 
+    def start_scheduled_image_sender(self):
+        if self.scheduled_image_timer is None:
+            self.scheduled_image_timer = QTimer(self)
+            self.scheduled_image_timer.timeout.connect(self.check_scheduled_image_send)
+            self.scheduled_image_timer.start(30000)
+            self.add_log("定时主动发图检查已就绪")
+        self.reset_scheduled_image_next_send()
+        QTimer.singleShot(1000, self.check_scheduled_image_send)
+
+    def stop_scheduled_image_sender(self):
+        if self.scheduled_image_timer is not None:
+            self.scheduled_image_timer.stop()
+            self.scheduled_image_timer = None
+        self.scheduled_image_next_at = None
+        self.set_status("timed_send", "未启用")
+        self.add_log("定时主动发图已关闭")
+
+    def reset_scheduled_image_next_send(self):
+        if not self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
+            return
+        self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(datetime.datetime.now())
+        self._update_scheduled_image_status()
+
+    def _get_scheduled_image_window(self, now):
+        settings_config = self.config.get("settings", {})
+        start = now.replace(
+            hour=settings_config.get("scheduled_image_start_hour", 9),
+            minute=settings_config.get("scheduled_image_start_minute", 0),
+            second=0,
+            microsecond=0,
+        )
+        end = now.replace(
+            hour=settings_config.get("scheduled_image_end_hour", 23),
+            minute=settings_config.get("scheduled_image_end_minute", 0),
+            second=0,
+            microsecond=0,
+        )
+        if end <= start:
+            end += datetime.timedelta(days=1)
+
+        previous_start = start - datetime.timedelta(days=1)
+        previous_end = end - datetime.timedelta(days=1)
+        if previous_start <= now < previous_end:
+            return previous_start, previous_end
+        return start, end
+
+    def _get_next_scheduled_image_window_start(self, now):
+        start, _end = self._get_scheduled_image_window(now)
+        if now < start:
+            return start
+        return start + datetime.timedelta(days=1)
+
+    def _get_scheduled_image_active_start(self, start):
+        settings_config = self.config.get("settings", {})
+        random_window = max(0, int(settings_config.get("scheduled_image_start_random_window_minutes", 0)))
+        return start - datetime.timedelta(minutes=random_window)
+
+    def _get_randomized_first_due_time(self, start, end, earliest_at=None):
+        settings_config = self.config.get("settings", {})
+        random_window = max(0, int(settings_config.get("scheduled_image_start_random_window_minutes", 0)))
+        active_start = self._get_scheduled_image_active_start(start)
+        earliest_due = active_start
+        if earliest_at is not None:
+            earliest_due = max(earliest_due, earliest_at)
+
+        latest_due = min(start + datetime.timedelta(minutes=random_window), end - datetime.timedelta(seconds=5))
+        if latest_due < earliest_due:
+            return ""
+
+        span_seconds = int((latest_due - earliest_due).total_seconds())
+        offset_seconds = random.randint(0, max(0, span_seconds))
+        return earliest_due + datetime.timedelta(seconds=offset_seconds)
+
+    def _get_initial_scheduled_image_due_time(self, now):
+        settings_config = self.config.get("settings", {})
+        min_lead_minutes = max(0, int(settings_config.get("scheduled_image_min_lead_minutes", 0)))
+        earliest_at = now + datetime.timedelta(minutes=min_lead_minutes)
+        start, end = self._get_scheduled_image_window(now)
+
+        if now < end:
+            due_time = self._get_randomized_first_due_time(start, end, earliest_at=earliest_at)
+            if due_time:
+                return due_time
+            latest_same_window_due = end - datetime.timedelta(seconds=5)
+            if earliest_at <= latest_same_window_due:
+                return earliest_at
+            next_start = start + datetime.timedelta(days=1)
+            next_end = end + datetime.timedelta(days=1)
+            return self._get_randomized_first_due_time(next_start, next_end)
+
+        next_start = self._get_next_scheduled_image_window_start(now)
+        next_end = next_start.replace(
+            hour=self.config.get("settings", {}).get("scheduled_image_end_hour", 23),
+            minute=self.config.get("settings", {}).get("scheduled_image_end_minute", 0),
+            second=0,
+            microsecond=0,
+        )
+        if next_end <= next_start:
+            next_end += datetime.timedelta(days=1)
+        return self._get_randomized_first_due_time(next_start, next_end)
+
+    def _get_next_scheduled_image_due_time(self, now):
+        settings_config = self.config.get("settings", {})
+        interval_minutes = max(1, int(settings_config.get("scheduled_image_interval_minutes", 60)))
+        random_window = max(0, int(settings_config.get("scheduled_image_random_window_minutes", 0)))
+        offset_minutes = interval_minutes
+        if random_window > 0:
+            offset_minutes += random.randint(-random_window, random_window)
+        offset_minutes = max(1, offset_minutes)
+
+        due_time = now + datetime.timedelta(minutes=offset_minutes)
+        _start, end = self._get_scheduled_image_window(now)
+        if due_time >= end:
+            next_start = self._get_next_scheduled_image_window_start(now)
+            next_end = next_start.replace(
+                hour=self.config.get("settings", {}).get("scheduled_image_end_hour", 23),
+                minute=self.config.get("settings", {}).get("scheduled_image_end_minute", 0),
+                second=0,
+                microsecond=0,
+            )
+            if next_end <= next_start:
+                next_end += datetime.timedelta(days=1)
+            return self._get_randomized_first_due_time(next_start, next_end)
+        return due_time
+
+    def _update_scheduled_image_status(self):
+        if not self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
+            self.set_status("timed_send", "未启用")
+            return
+        if self.scheduled_image_sending:
+            self.set_status("timed_send", "发送中")
+            return
+        if self.scheduled_image_next_at:
+            self.set_status("timed_send", f"下次 {self.scheduled_image_next_at:%m-%d %H:%M}")
+        else:
+            self.set_status("timed_send", "待安排")
+
+    def check_scheduled_image_send(self):
+        settings_config = self.config.get("settings", {})
+        if not settings_config.get("enable_scheduled_image_sender", False):
+            return
+        if self.scheduled_image_sending:
+            self._update_scheduled_image_status()
+            return
+
+        now = datetime.datetime.now()
+        start, end = self._get_scheduled_image_window(now)
+        active_start = self._get_scheduled_image_active_start(start)
+        if not (active_start <= now < end):
+            if self.scheduled_image_next_at is None or self.scheduled_image_next_at <= now:
+                self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(now)
+            self._update_scheduled_image_status()
+            return
+
+        if self.scheduled_image_next_at is None:
+            self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(now)
+            self._update_scheduled_image_status()
+            return
+
+        if now < self.scheduled_image_next_at:
+            self._update_scheduled_image_status()
+            return
+
+        due_time = self.scheduled_image_next_at
+        self.scheduled_image_next_at = None
+        self.scheduled_image_sending = True
+        self.set_status("timed_send", "发送中")
+        self.add_log(f"到达定时发图时间: {due_time:%Y-%m-%d %H:%M}")
+        threading.Thread(target=self._scheduled_image_send_worker, daemon=True).start()
+
+    def _scheduled_image_send_worker(self):
+        _uia_init = auto.UIAutomationInitializerInThread()
+        try:
+            settings_config = self.config.get("settings", {})
+            trigger_sender = settings_config.get("trigger_sender", "momo").strip()
+            material_folder = settings_config.get("scheduled_image_folder", "").strip()
+            if not trigger_sender:
+                self.set_status("send_result", "失败: 未配置目标窗口")
+                self.add_log("定时发图失败: 未配置目标对话/触发者昵称")
+                return
+
+            folder_problem = self.get_folder_access_message(material_folder)
+            if folder_problem:
+                self.set_status("send_result", "失败: 定时图片目录不可访问")
+                self.add_log(f"定时发图失败: {folder_problem}")
+                return
+
+            images = self.get_valid_images(material_folder)
+            if len(images) == 0:
+                self.set_status("send_result", "失败: 没有可发送图片")
+                self.add_log("定时发图失败: 指定素材文件夹中没有图片可发")
+                return
+
+            selected_image = random.choice(images)
+            self.add_log(f"定时发图已抽取图片: {os.path.basename(selected_image)}")
+            result = self.wechat.send_file(trigger_sender, selected_image)
+            if not result:
+                self.set_status("send_result", f"失败: {result.message}")
+                self.add_log(f"定时发图失败: {result.message}")
+                return
+
+            moved_path = self._move_to_sent_folder(selected_image)
+            self.set_status("send_result", result.message)
+            self.add_log(f"定时发图成功: {result.message}")
+            self.add_log(f"已移动到已发送目录: {moved_path}")
+            self.update_scheduled_img_count_signal.emit()
+        except Exception as exc:
+            self.set_status("send_result", f"异常: {exc}")
+            self.add_log(f"定时发图异常: {exc}")
+        finally:
+            self.scheduled_image_sending = False
+            if self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
+                self.scheduled_image_next_at = self._get_next_scheduled_image_due_time(datetime.datetime.now())
+                self._update_scheduled_image_status()
+                self.add_log(f"下一次定时发图已安排: {self.scheduled_image_next_at:%Y-%m-%d %H:%M}")
+            _uia_init = None
+
     def _get_windows_system_tool(self, exe_name):
         system_root = os.environ.get("SystemRoot") or os.environ.get("windir") or r"C:\Windows"
         candidates = [
@@ -1037,9 +1652,18 @@ class MomoReplyGUI(QWidget):
                 return
 
             narrator_exe = self._get_windows_system_tool("Narrator.exe")
-            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            subprocess.Popen([narrator_exe], close_fds=True, creationflags=creationflags)
-            self.add_log("已请求开启 Windows 讲述人")
+            try:
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                subprocess.Popen([narrator_exe], close_fds=True, creationflags=creationflags)
+                self.add_log("已请求开启 Windows 讲述人")
+            except OSError as exc:
+                if not self._is_permission_error(str(exc)):
+                    raise
+                self.add_log("开启 Windows 讲述人需要管理员权限，正在请求授权")
+                elevated, elevated_message = self._run_executable_as_admin(narrator_exe)
+                if not elevated:
+                    raise RuntimeError(elevated_message)
+                self.add_log("已发起管理员授权开启 Windows 讲述人")
             QTimer.singleShot(1500, lambda: self.set_status("narrator", self.get_narrator_status_text()))
         except Exception as exc:
             self.add_log(f"开启 Windows 讲述人失败: {exc}")
@@ -1080,26 +1704,17 @@ class MomoReplyGUI(QWidget):
             parse_note = f"读取远程会话失败: {exc}"
         else:
             parse_note = ""
+            session_id = self._parse_query_user_session_id(result.stdout)
+            if session_id:
+                if result.returncode != 0:
+                    self.add_log("query user 返回码异常，但已从输出中识别到当前会话 ID")
+                return session_id, ""
+
+            raw_output = (result.stderr or result.stdout or "query user 执行失败").strip()
             if result.returncode != 0:
-                parse_note = (result.stderr or result.stdout or "query user 执行失败").strip()
+                parse_note = raw_output
             else:
-                lines = result.stdout.splitlines()
-                current_lines = [line for line in lines if line.lstrip().startswith(">")]
-
-                username = os.environ.get("USERNAME", "").lower()
-                if username:
-                    current_lines.extend(
-                        line
-                        for line in lines[1:]
-                        if line.lstrip().lstrip(">").strip().lower().startswith(username)
-                    )
-
-                for line in current_lines:
-                    tokens = line.lstrip().lstrip(">").strip().split()
-                    for token in tokens[1:4]:
-                        if token.isdigit():
-                            return token, ""
-                parse_note = (result.stdout or "未能从 query user 解析当前会话 ID").strip()
+                parse_note = raw_output or "未能从 query user 解析当前会话 ID"
 
         session_name = os.environ.get("SESSIONNAME", "").strip()
         if session_name and session_name.lower() != "console":
@@ -1107,9 +1722,43 @@ class MomoReplyGUI(QWidget):
 
         return None, parse_note or "未检测到远程桌面会话"
 
+    def _parse_query_user_session_id(self, output):
+        lines = str(output or "").splitlines()
+        current_lines = [line for line in lines if line.lstrip().startswith(">")]
+
+        username = os.environ.get("USERNAME", "").lower()
+        if username:
+            current_lines.extend(
+                line
+                for line in lines[1:]
+                if line.lstrip().lstrip(">").strip().lower().startswith(username)
+            )
+
+        seen = set()
+        for line in current_lines:
+            normalized = line.lstrip().lstrip(">").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            tokens = normalized.split()
+            for token in tokens[1:5]:
+                if token.isdigit():
+                    return token
+        return ""
+
     def _is_permission_error(self, message):
         lower_message = message.lower()
-        permission_keywords = ("access is denied", "拒绝访问", "权限")
+        permission_keywords = (
+            "access is denied",
+            "requires elevation",
+            "requested operation requires elevation",
+            "winerror 740",
+            "740",
+            "拒绝访问",
+            "权限",
+            "需要提升",
+            "请求的操作需要提升",
+        )
         return any(keyword in lower_message or keyword in message for keyword in permission_keywords)
 
     def _format_tscon_error(self, message):
@@ -1118,15 +1767,15 @@ class MomoReplyGUI(QWidget):
             return f"{message}\n\n请以管理员身份运行本软件后重试。"
         return message
 
-    def _run_tscon_as_admin(self, tscon_exe, session_identifier):
+    def _run_executable_as_admin(self, executable, params="", show=1):
         try:
             result = ctypes.windll.shell32.ShellExecuteW(
                 None,
                 "runas",
-                tscon_exe,
-                f"{session_identifier} /dest:console",
+                str(executable),
+                params,
                 None,
-                0,
+                show,
             )
         except Exception as exc:
             return False, str(exc)
@@ -1134,6 +1783,9 @@ class MomoReplyGUI(QWidget):
         if result <= 32:
             return False, f"管理员授权启动失败，错误码: {result}"
         return True, ""
+
+    def _run_tscon_as_admin(self, tscon_exe, session_identifier):
+        return self._run_executable_as_admin(tscon_exe, f"{session_identifier} /dest:console", show=0)
 
     def disconnect_remote_session(self):
         if os.name != "nt":
@@ -1192,14 +1844,14 @@ class MomoReplyGUI(QWidget):
             QWidget#sidePanel, QWidget#actionPanel {
                 background: #ffffff;
                 border: 1px solid #dce3ed;
-                border-radius: 12px;
+                border-radius: 8px;
             }
             QGroupBox {
                 font-weight: 600;
                 border: 1px solid #dce3ed;
-                border-radius: 12px;
-                margin-top: 14px;
-                padding: 16px 12px 12px 12px;
+                border-radius: 8px;
+                margin-top: 12px;
+                padding: 14px 12px 12px 12px;
                 background: #ffffff;
             }
             QGroupBox::title {
@@ -1248,7 +1900,7 @@ class MomoReplyGUI(QWidget):
             }
             QTabWidget::pane {
                 border: 1px solid #dce3ed;
-                border-radius: 12px;
+                border-radius: 8px;
                 background: #ffffff;
             }
             QTabBar::tab {
@@ -1265,14 +1917,14 @@ class MomoReplyGUI(QWidget):
             }
             QListWidget {
                 border: 1px solid #dce3ed;
-                border-radius: 12px;
+                border-radius: 8px;
                 background: #fbfcfe;
                 padding: 6px;
             }
             QWidget#statusCard {
                 background: #f8fafc;
                 border: 1px solid #e4eaf2;
-                border-radius: 10px;
+                border-radius: 8px;
             }
             QLabel#statusTitle {
                 color: #667085;
@@ -1290,6 +1942,29 @@ class MomoReplyGUI(QWidget):
             """
         )
 
+    def available_screen_geometry(self):
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen:
+            return screen.availableGeometry()
+        return QApplication.desktop().availableGeometry()
+
+    def apply_initial_window_geometry(self):
+        screen_rect = self.available_screen_geometry()
+        margin = 40 if min(screen_rect.width(), screen_rect.height()) >= 900 else 16
+        max_width = max(320, screen_rect.width() - margin)
+        max_height = max(320, screen_rect.height() - margin)
+
+        preferred_width = min(int(screen_rect.width() * 0.72), 1800)
+        preferred_height = int(screen_rect.height() * 0.88)
+        initial_width = min(max(1120, preferred_width), max_width)
+        initial_height = min(max(720, preferred_height), max_height)
+        self.setMinimumSize(min(760, max_width), min(520, max_height))
+        self.resize(initial_width, initial_height)
+        self.move(
+            screen_rect.x() + max(0, (screen_rect.width() - initial_width) // 2),
+            screen_rect.y() + max(0, (screen_rect.height() - initial_height) // 2),
+        )
+
     def initUI(self):
         self.setObjectName("root")
         self.apply_app_style()
@@ -1302,7 +1977,9 @@ class MomoReplyGUI(QWidget):
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(12)
-        sidebar.setFixedWidth(300)
+        sidebar.setMinimumWidth(260)
+        sidebar.setMaximumWidth(340)
+        sidebar.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
 
         action_panel = QWidget()
         action_panel.setObjectName("actionPanel")
@@ -1368,15 +2045,22 @@ class MomoReplyGUI(QWidget):
         config_layout.setSpacing(10)
         config_layout.addWidget(self.init_language_choose())
         config_layout.addLayout(self.init_settings())
+        config_layout.addLayout(self.init_keyword_timing_settings())
         config_layout.addStretch()
         config_scroll.setWidget(config_inner)
-        tabs.addTab(config_scroll, "规则配置")
+        tabs.addTab(config_scroll, "关键词触发回复")
 
-        schedule_page = QWidget()
-        schedule_layout = QVBoxLayout(schedule_page)
+        schedule_scroll = QScrollArea()
+        schedule_scroll.setWidgetResizable(True)
+        schedule_scroll.setFrameShape(QScrollArea.NoFrame)
+        schedule_inner = QWidget()
+        schedule_layout = QVBoxLayout(schedule_inner)
         schedule_layout.setContentsMargins(12, 12, 12, 12)
-        schedule_layout.addLayout(self.init_time_settings())
-        tabs.addTab(schedule_page, "定时设置")
+        schedule_layout.setSpacing(10)
+        schedule_layout.addLayout(self.init_scheduled_image_settings())
+        schedule_layout.addStretch()
+        schedule_scroll.setWidget(schedule_inner)
+        tabs.addTab(schedule_scroll, "主动定时发送")
 
         log_page = QWidget()
         log_layout = QVBoxLayout(log_page)
@@ -1387,15 +2071,25 @@ class MomoReplyGUI(QWidget):
         outer_layout.addWidget(sidebar)
         outer_layout.addWidget(tabs, 1)
 
-        desktop = QApplication.desktop()
-        screen_rect = desktop.screenGeometry()
         self.setLayout(outer_layout)
-        self.resize(int(screen_rect.width() * 0.55), int(screen_rect.height() * 0.82))
+        self.apply_initial_window_geometry()
         self.setWindowTitle("微信自动回复助手")
         self.show()
 
 
+def configure_high_dpi():
+    if hasattr(Qt, "AA_EnableHighDpiScaling"):
+        QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    if hasattr(Qt, "AA_UseHighDpiPixmaps"):
+        QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
+
+    rounding_policy = getattr(Qt, "HighDpiScaleFactorRoundingPolicy", None)
+    if rounding_policy and hasattr(QApplication, "setHighDpiScaleFactorRoundingPolicy"):
+        QApplication.setHighDpiScaleFactorRoundingPolicy(rounding_policy.PassThrough)
+
+
 if __name__ == "__main__":
+    configure_high_dpi()
     app = QApplication(sys.argv)
     ex = MomoReplyGUI()
     sys.exit(app.exec_())

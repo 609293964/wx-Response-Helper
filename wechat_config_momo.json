@@ -4,7 +4,17 @@
         "trigger_sender": "momo",
         "active_rules_count": 1,
         "send_delay": 2.0,
-        "random_delay": 0
+        "random_delay": 0,
+        "enable_scheduled_image_sender": true,
+        "scheduled_image_folder": "//nasss/机械1/photo/cat",
+        "scheduled_image_start_hour": 20,
+        "scheduled_image_start_minute": 0,
+        "scheduled_image_start_random_window_minutes": 28,
+        "scheduled_image_min_lead_minutes": 10,
+        "scheduled_image_end_hour": 23,
+        "scheduled_image_end_minute": 0,
+        "scheduled_image_interval_minutes": 60,
+        "scheduled_image_random_window_minutes": 15
     },
     "rules": [
         {
