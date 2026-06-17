@@ -2,19 +2,25 @@
     "settings": {
         "language": "zh-CN",
         "trigger_sender": "momo",
+        "wechat_launch_path": "C:\\Users\\Public\\Desktop\\微信.lnk",
         "active_rules_count": 1,
         "send_delay": 2.0,
         "random_delay": 0,
-        "enable_scheduled_image_sender": true,
+        "enable_scheduled_image_sender": false,
         "scheduled_image_folder": "//nasss/机械1/photo/cat",
         "scheduled_image_start_hour": 20,
         "scheduled_image_start_minute": 0,
-        "scheduled_image_start_random_window_minutes": 28,
-        "scheduled_image_min_lead_minutes": 10,
         "scheduled_image_end_hour": 23,
         "scheduled_image_end_minute": 0,
         "scheduled_image_interval_minutes": 60,
-        "scheduled_image_random_window_minutes": 15
+        "scheduled_image_random_window_minutes": 15,
+        "remote_control_enabled": true,
+        "remote_control_bind": "0.0.0.0",
+        "remote_control_port": 8765,
+        "remote_control_token": "UitMvzyAy4-XD_29pLZgJEJampxSl3oz",
+        "scheduled_image_pause_on_contact_message": false,
+        "scheduled_image_resume_delay_minutes": 5,
+        "scheduled_image_first_delay_minutes": 28
     },
     "rules": [
         {

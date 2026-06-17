@@ -1,0 +1,4 @@
+2026-06-10 22:09:46.101 <stdin>[7] <module> -> Find Control Timeout(10s): {Name: '??', ControlType: EditControl}
+2026-06-10 22:11:11.505 <stdin>[7] <module> -> Find Control Timeout(3s): {AutomationId: 'search_item_momo', ControlType: ListItemControl}
+2026-06-10 22:11:35.871 <stdin>[12] <module> -> Find Control Timeout(4s): {ClassName: 'mmui::SearchContentPopover', ControlType: WindowControl}
+2026-06-11 00:44:36.355 <stdin>[4] <module> -> Find Control Timeout(10s): {Name: '??', ControlType: ButtonControl}

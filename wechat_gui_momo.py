@@ -1,13 +1,17 @@
 import datetime
 import ctypes
+import csv
 import json
 import os
 import random
+import secrets
 import shutil
+import socket as network_socket
 import subprocess
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 # Keep Qt controls sharp and correctly sized on 4K/high-DPI displays while
@@ -15,6 +19,14 @@ from pathlib import Path
 os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 os.environ.setdefault("QT_ENABLE_HIGHDPI_SCALING", "1")
 os.environ.setdefault("QT_SCALE_FACTOR_ROUNDING_POLICY", "PassThrough")
+
+from windows_dpi import configure_windows_dpi_awareness
+
+
+configure_windows_dpi_awareness()
+
+APP_WINDOW_TITLE = "EasyChat Momo - 微信自动回复助手"
+ONE_CLICK_LOGIN_CONFIRM_TIMEOUT_SECONDS = 180
 
 
 def is_running_as_admin():
@@ -60,6 +72,57 @@ def show_admin_launch_error():
         print(message, file=sys.stderr)
 
 
+def activate_existing_app_window():
+    if os.name != "nt":
+        return False
+    try:
+        hwnd = ctypes.windll.user32.FindWindowW(None, APP_WINDOW_TITLE)
+        if not hwnd:
+            return False
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).resolve().parent
+        else:
+            base_dir = Path(__file__).resolve().parent
+        request_path = base_dir / "logs" / "activate.request"
+        request_path.parent.mkdir(parents=True, exist_ok=True)
+        request_path.write_text(str(time.time()), encoding="ascii")
+        ctypes.windll.user32.ShowWindow(hwnd, 9)
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+        return True
+    except Exception:
+        return False
+
+
+def report_unhandled_exception(exc_type, exc_value, exc_traceback):
+    if issubclass(exc_type, KeyboardInterrupt):
+        sys.__excepthook__(exc_type, exc_value, exc_traceback)
+        return
+
+    if getattr(sys, "frozen", False):
+        base_dir = Path(sys.executable).resolve().parent
+    else:
+        base_dir = Path(__file__).resolve().parent
+    error_path = base_dir / "logs" / "startup_error.log"
+    try:
+        error_path.parent.mkdir(parents=True, exist_ok=True)
+        with error_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"\n[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}]\n")
+            traceback.print_exception(
+                exc_type,
+                exc_value,
+                exc_traceback,
+                file=handle,
+            )
+    except Exception:
+        pass
+
+    message = f"程序运行异常：{exc_value}\n\n详细信息已写入：\n{error_path}"
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "EasyChat Momo", 0x10)
+    except Exception:
+        pass
+
+
 def ensure_admin_or_exit():
     if os.name != "nt" or is_running_as_admin():
         return
@@ -71,6 +134,8 @@ def ensure_admin_or_exit():
 
 if __name__ == "__main__":
     ensure_admin_or_exit()
+    if activate_existing_app_window():
+        sys.exit(0)
 
 
 import uiautomation as auto
@@ -100,6 +165,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ui_auto_wechat import WeChat
+from remote_control_server import API_VERSION, SERVICE_NAME, RemoteControlServer
 from wechat_locale import WeChatLocale
 
 
@@ -108,6 +174,11 @@ class MomoReplyGUI(QWidget):
     update_img_count_signal = pyqtSignal(int)
     update_scheduled_img_count_signal = pyqtSignal()
     status_signal = pyqtSignal(str, str)
+    pause_scheduled_image_sender_signal = pyqtSignal(str)
+    update_scheduled_calculation_signal = pyqtSignal()
+    remote_command_signal = pyqtSignal(str)
+    target_window_action_finished_signal = pyqtSignal(bool, str)
+    one_click_target_finished_signal = pyqtSignal(bool, str)
 
     def __init__(self):
         super().__init__()
@@ -115,6 +186,7 @@ class MomoReplyGUI(QWidget):
         self.config_path = self.base_dir / "wechat_config_momo.json"
         self.logs_dir = self.base_dir / "logs"
         self.app_log_path = self.logs_dir / "app.log"
+        self.activation_request_path = self.logs_dir / "activate.request"
         self.config_load_notes = []
 
         self.config = self.load_config()
@@ -128,19 +200,56 @@ class MomoReplyGUI(QWidget):
         self.scheduled_image_timer = None
         self.scheduled_image_next_at = None
         self.scheduled_image_sending = False
+        self.scheduled_image_schedule_mode = None
+        self.scheduled_image_schedule_base_at = None
+        self.scheduled_image_pause_reason = ""
+        self.scheduled_image_waiting_for_reply = False
+        self.scheduled_image_waiting_text = ""
+        self.scheduled_image_waiting_since = None
+        self.scheduled_image_resume_after = None
+        self.scheduled_image_deferred_due_at = None
+        self.expected_self_message_until = None
+        self.conversation_guard_lock = threading.Lock()
         self.status_timer = None
         self.rule_img_count_labels = {}
         self.scheduled_img_count_label = None
         self.scheduled_folder_input = None
+        self.scheduled_image_calculation_label = None
+        self.scheduled_pause_on_contact_checkbox = None
+        self.scheduled_resume_delay_spin = None
+        self.scheduled_mark_replied_btn = None
         self.status_labels = {}
+        self.status_values = {}
+        self.last_remote_error = ""
+        self.last_startup_check_summary = "尚未自检"
+        self.remote_control_server = None
+        self.remote_service_status_label = None
+        self.remote_port_spin = None
+        self.remote_enabled_checkbox = None
+        self.wechat_launch_path_input = None
+        self.one_click_run_btn = None
+        self.one_click_run_active = False
+        self.one_click_narrator_was_running = False
+        self.one_click_stage_deadline = 0
+        self.one_click_login_wait_deadline = 0
+        self.one_click_tree_stable_count = 0
+        self.one_click_login_button_clicked = False
+        self.open_target_window_btn = None
+        self.open_target_window_active = False
 
         self.add_log_signal.connect(self._do_add_log)
         self.update_img_count_signal.connect(self._do_update_img_count)
         self.update_scheduled_img_count_signal.connect(self._do_update_scheduled_img_count)
         self.status_signal.connect(self._do_update_status)
+        self.pause_scheduled_image_sender_signal.connect(self._pause_scheduled_image_sender)
+        self.update_scheduled_calculation_signal.connect(self._update_scheduled_image_calculation)
+        self.remote_command_signal.connect(self._handle_remote_command)
+        self.target_window_action_finished_signal.connect(self._finish_open_target_window)
+        self.one_click_target_finished_signal.connect(self._finish_one_click_target_window)
 
         self.initUI()
         self.start_status_timer()
+        self.start_remote_control_server()
 
         if self.config.get("settings", {}).get("enable_auto_timer", False):
             self.enable_auto_timer.setChecked(True)
@@ -162,6 +271,7 @@ class MomoReplyGUI(QWidget):
             "settings": {
                 "language": "zh-CN",
                 "trigger_sender": "momo",
+                "wechat_launch_path": "",
                 "active_rules_count": 1,
                 "send_delay": 2.0,
                 "random_delay": 0,
@@ -169,12 +279,17 @@ class MomoReplyGUI(QWidget):
                 "scheduled_image_folder": "",
                 "scheduled_image_start_hour": 9,
                 "scheduled_image_start_minute": 0,
-                "scheduled_image_start_random_window_minutes": 30,
-                "scheduled_image_min_lead_minutes": 10,
+                "scheduled_image_first_delay_minutes": 30,
                 "scheduled_image_end_hour": 23,
                 "scheduled_image_end_minute": 0,
                 "scheduled_image_interval_minutes": 60,
                 "scheduled_image_random_window_minutes": 15,
+                "scheduled_image_pause_on_contact_message": True,
+                "scheduled_image_resume_delay_minutes": 5,
+                "remote_control_enabled": True,
+                "remote_control_bind": "0.0.0.0",
+                "remote_control_port": 8765,
+                "remote_control_token": secrets.token_urlsafe(24),
             },
             "rules": [
                 {"keywords": "!,！", "reply_type": "image", "folder": "", "reply_text": "", "mode": "exact"},
@@ -228,7 +343,33 @@ class MomoReplyGUI(QWidget):
             settings = config["settings"]
             changed = True
 
+        legacy_wechat_path = settings.get("wechat_path")
+        if (
+            "wechat_launch_path" not in settings
+            and isinstance(legacy_wechat_path, str)
+            and legacy_wechat_path.strip()
+        ):
+            settings["wechat_launch_path"] = legacy_wechat_path.strip()
+            changed = True
+
         for stale_key in ("wechat_path", "material_folder", "trigger_keywords", "monitor_backend"):
+            if stale_key in settings:
+                settings.pop(stale_key, None)
+                changed = True
+
+        if "scheduled_image_first_delay_minutes" not in settings:
+            legacy_first_delay = settings.get(
+                "scheduled_image_start_random_window_minutes",
+                settings.get("scheduled_image_min_lead_minutes", 30),
+            )
+            settings["scheduled_image_first_delay_minutes"] = legacy_first_delay
+            changed = True
+
+        for stale_key in (
+            "scheduled_image_start_random_window_minutes",
+            "scheduled_image_min_lead_minutes",
+            "scheduled_image_min_lead_random_window_minutes",
+        ):
             if stale_key in settings:
                 settings.pop(stale_key, None)
                 changed = True
@@ -250,12 +391,13 @@ class MomoReplyGUI(QWidget):
         numeric_ranges = {
             "scheduled_image_start_hour": (0, 23, 9),
             "scheduled_image_start_minute": (0, 59, 0),
-            "scheduled_image_start_random_window_minutes": (0, 720, 30),
-            "scheduled_image_min_lead_minutes": (0, 120, 10),
+            "scheduled_image_first_delay_minutes": (0, 1440, 30),
             "scheduled_image_end_hour": (0, 23, 23),
             "scheduled_image_end_minute": (0, 59, 0),
             "scheduled_image_interval_minutes": (1, 1440, 60),
             "scheduled_image_random_window_minutes": (0, 720, 15),
+            "scheduled_image_resume_delay_minutes": (0, 120, 5),
+            "remote_control_port": (1024, 65535, 8765),
         }
         for key, (minimum, maximum, default) in numeric_ranges.items():
             try:
@@ -270,8 +412,25 @@ class MomoReplyGUI(QWidget):
         if not isinstance(settings.get("enable_scheduled_image_sender"), bool):
             settings["enable_scheduled_image_sender"] = bool(settings.get("enable_scheduled_image_sender"))
             changed = True
+        if not isinstance(settings.get("scheduled_image_pause_on_contact_message"), bool):
+            settings["scheduled_image_pause_on_contact_message"] = bool(
+                settings.get("scheduled_image_pause_on_contact_message")
+            )
+            changed = True
+        if not isinstance(settings.get("remote_control_enabled"), bool):
+            settings["remote_control_enabled"] = bool(settings.get("remote_control_enabled"))
+            changed = True
+        if not isinstance(settings.get("remote_control_bind"), str):
+            settings["remote_control_bind"] = "0.0.0.0"
+            changed = True
+        if not isinstance(settings.get("remote_control_token"), str) or not settings.get("remote_control_token"):
+            settings["remote_control_token"] = secrets.token_urlsafe(24)
+            changed = True
         if not isinstance(settings.get("scheduled_image_folder"), str):
             settings["scheduled_image_folder"] = ""
+            changed = True
+        if not isinstance(settings.get("wechat_launch_path"), str):
+            settings["wechat_launch_path"] = ""
             changed = True
 
         rules = config.setdefault("rules", [])
@@ -310,6 +469,286 @@ class MomoReplyGUI(QWidget):
         with self.config_path.open("w", encoding="utf-8") as handle:
             json.dump(self.config, handle, indent=4, ensure_ascii=False)
 
+    def find_default_wechat_launch_path(self):
+        if os.name != "nt":
+            return ""
+
+        desktop_candidates = [
+            Path.home() / "Desktop",
+            Path(os.environ.get("PUBLIC", r"C:\Users\Public")) / "Desktop",
+        ]
+        one_drive = os.environ.get("OneDrive")
+        if one_drive:
+            desktop_candidates.extend([Path(one_drive) / "Desktop", Path(one_drive) / "桌面"])
+
+        shortcut_names = ("微信.lnk", "WeChat.lnk", "Weixin.lnk")
+        for desktop in desktop_candidates:
+            for name in shortcut_names:
+                candidate = desktop / name
+                if candidate.is_file():
+                    return str(candidate)
+
+        program_files = [
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("LOCALAPPDATA"),
+        ]
+        relative_paths = (
+            Path("Tencent") / "Weixin" / "Weixin.exe",
+            Path("Tencent") / "WeChat" / "WeChat.exe",
+        )
+        for root in program_files:
+            if not root:
+                continue
+            for relative_path in relative_paths:
+                candidate = Path(root) / relative_path
+                if candidate.is_file():
+                    return str(candidate)
+        return ""
+
+    def get_wechat_launch_path(self):
+        configured = self.config.get("settings", {}).get("wechat_launch_path", "").strip().strip('"')
+        if configured and Path(configured).is_file():
+            return configured
+
+        detected = self.find_default_wechat_launch_path()
+        if detected:
+            self.config.setdefault("settings", {})["wechat_launch_path"] = detected
+            if self.wechat_launch_path_input is not None:
+                self.wechat_launch_path_input.setText(detected)
+            self.save_config()
+        return detected
+
+    def get_lan_ipv4_addresses(self):
+        addresses = set()
+        try:
+            hostname = network_socket.gethostname()
+            for item in network_socket.getaddrinfo(hostname, None, network_socket.AF_INET):
+                address = item[4][0]
+                if address and not address.startswith("127."):
+                    addresses.add(address)
+        except OSError:
+            pass
+        return sorted(addresses)
+
+    def get_remote_status(self):
+        settings = self.config.get("settings", {})
+        try:
+            narrator_running = self.is_narrator_running()
+            narrator_status = "已开启" if narrator_running else "未开启"
+        except Exception as exc:
+            narrator_running = False
+            narrator_status = f"检查失败: {exc}"
+
+        next_send_at = ""
+        if self.scheduled_image_next_at is not None:
+            next_send_at = self.scheduled_image_next_at.astimezone().isoformat(timespec="seconds")
+
+        return {
+            "service": SERVICE_NAME,
+            "api_version": API_VERSION,
+            "remote_enabled": bool(settings.get("remote_control_enabled", True)),
+            "server_time": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "monitoring": bool(self.monitoring),
+            "narrator_running": narrator_running,
+            "narrator_status": narrator_status,
+            "target": settings.get("trigger_sender", ""),
+            "scheduled_enabled": bool(settings.get("enable_scheduled_image_sender", False)),
+            "scheduled_sending": bool(self.scheduled_image_sending),
+            "next_send_at": next_send_at,
+            "timed_send_status": self.status_values.get("timed_send", "未启用"),
+            "last_message": self.status_values.get("last_message", "-"),
+            "last_trigger": self.status_values.get("last_trigger", "-"),
+            "conversation_guard": self.status_values.get("conversation_guard", "未触发"),
+            "send_result": self.status_values.get("send_result", "-"),
+            "schedule_calculation": self._build_scheduled_image_calculation_text(),
+            "last_error": self.last_remote_error,
+            "startup_check_summary": self.last_startup_check_summary,
+        }
+
+    def start_remote_control_server(self):
+        self.stop_remote_control_server()
+        settings = self.config.get("settings", {})
+        if not settings.get("remote_control_enabled", True):
+            self._set_remote_service_status("未启用")
+            self.last_remote_error = ""
+            return
+
+        host = settings.get("remote_control_bind", "0.0.0.0").strip() or "0.0.0.0"
+        port = int(settings.get("remote_control_port", 8765))
+        token = settings.get("remote_control_token", "")
+        if not token:
+            self.last_remote_error = "访问令牌为空，远程控制服务未启动"
+            self._set_remote_service_status("启动失败: 访问令牌为空")
+            self.add_log("手机远程控制服务启动失败: 访问令牌为空")
+            return
+        try:
+            self.remote_control_server = RemoteControlServer(
+                host=host,
+                port=port,
+                token=token,
+                status_provider=self.get_remote_status,
+                command_handler=self.remote_command_signal.emit,
+                logger=self.add_log,
+            )
+            self.remote_control_server.start()
+            addresses = self.get_lan_ipv4_addresses()
+            endpoint = ", ".join(f"http://{address}:{port}" for address in addresses)
+            if not endpoint:
+                endpoint = f"http://本机IP:{port}"
+            self._set_remote_service_status("运行中: " + endpoint)
+            self.add_log("手机远程控制服务已启动: " + endpoint)
+            self.last_remote_error = ""
+        except Exception as exc:
+            self.remote_control_server = None
+            detail = self.format_remote_start_error(exc, host, port)
+            self.last_remote_error = detail
+            self._set_remote_service_status("启动失败: " + detail)
+            self.add_log("手机远程控制服务启动失败: " + detail)
+
+    def format_remote_start_error(self, exc, host, port):
+        winerror = getattr(exc, "winerror", None)
+        errno = getattr(exc, "errno", None)
+        raw_message = str(exc).strip() or exc.__class__.__name__
+        if winerror == 10048 or errno == 98:
+            return f"端口 {port} 已被占用，请换一个监听端口后重试"
+        if winerror == 10013 or errno == 13:
+            return "绑定被系统拒绝，请检查 Windows 防火墙、管理员权限或专用网络授权"
+        if winerror == 10049 or errno == 99:
+            return f"绑定地址 {host} 不可用，请改回 0.0.0.0 或使用本机局域网地址"
+        return raw_message
+
+    def get_mobile_connection_package(self):
+        settings = self.config.get("settings", {})
+        address_list = self.get_lan_ipv4_addresses()
+        host = address_list[0] if address_list else "本机IP"
+        port = self.remote_port_spin.value() if self.remote_port_spin is not None else int(settings.get("remote_control_port", 8765))
+        return {
+            "service": SERVICE_NAME,
+            "host": host,
+            "port": port,
+            "token": settings.get("remote_control_token", ""),
+            "api_version": API_VERSION,
+        }
+
+    def copy_mobile_connection_package(self):
+        package = self.get_mobile_connection_package()
+        QApplication.clipboard().setText(json.dumps(package, ensure_ascii=False))
+        self.add_log("已复制手机连接信息")
+        QMessageBox.information(self, "已复制", "手机连接信息已复制，可直接粘贴到 HarmonyOS 应用设置页。")
+
+    def stop_remote_control_server(self):
+        server = self.remote_control_server
+        self.remote_control_server = None
+        if server is not None:
+            server.stop()
+
+    def restart_remote_control_server(self):
+        settings = self.config.setdefault("settings", {})
+        if self.remote_enabled_checkbox is not None:
+            settings["remote_control_enabled"] = self.remote_enabled_checkbox.isChecked()
+        if self.remote_port_spin is not None:
+            settings["remote_control_port"] = self.remote_port_spin.value()
+        self.save_config()
+        self.start_remote_control_server()
+
+    def _set_remote_service_status(self, message):
+        if self.remote_service_status_label is not None:
+            self.remote_service_status_label.setText(message)
+
+    def _handle_remote_command(self, command):
+        self.add_log(f"收到手机远程命令: {command}")
+        if command == "narrator_start":
+            self.start_narrator()
+        elif command == "narrator_stop":
+            self.stop_narrator()
+        elif command == "monitoring_start":
+            if not self.monitoring:
+                self.start_monitoring()
+        elif command == "monitoring_stop":
+            if self.monitoring:
+                self.stop_monitoring()
+        elif command == "scheduled_start":
+            self.config.setdefault("settings", {})["enable_scheduled_image_sender"] = True
+            self.save_config()
+            if hasattr(self, "enable_scheduled_image_sender"):
+                if not self.enable_scheduled_image_sender.isChecked():
+                    self.enable_scheduled_image_sender.setChecked(True)
+                else:
+                    self.start_scheduled_image_sender()
+            else:
+                self.start_scheduled_image_sender()
+        elif command == "scheduled_stop":
+            self.config.setdefault("settings", {})["enable_scheduled_image_sender"] = False
+            self.save_config()
+            if hasattr(self, "enable_scheduled_image_sender"):
+                if self.enable_scheduled_image_sender.isChecked():
+                    self.enable_scheduled_image_sender.setChecked(False)
+                else:
+                    self.stop_scheduled_image_sender()
+            else:
+                self.stop_scheduled_image_sender()
+        elif command == "run_check":
+            self.run_startup_check()
+
+    def init_remote_control_settings(self):
+        settings = self.config.get("settings", {})
+        group = QGroupBox("手机远程控制")
+        layout = QFormLayout()
+
+        self.remote_enabled_checkbox = QCheckBox("允许局域网内的 HarmonyOS 应用控制")
+        self.remote_enabled_checkbox.setChecked(settings.get("remote_control_enabled", True))
+
+        self.remote_port_spin = QSpinBox()
+        self.remote_port_spin.setRange(1024, 65535)
+        self.remote_port_spin.setValue(settings.get("remote_control_port", 8765))
+
+        token_input = QLineEdit(settings.get("remote_control_token", ""))
+        token_input.setReadOnly(True)
+        token_input.setEchoMode(QLineEdit.Password)
+
+        show_token_checkbox = QCheckBox("显示令牌")
+        show_token_checkbox.stateChanged.connect(
+            lambda state: token_input.setEchoMode(QLineEdit.Normal if state == Qt.Checked else QLineEdit.Password)
+        )
+
+        copy_token_btn = QPushButton("复制令牌")
+        copy_token_btn.clicked.connect(lambda: QApplication.clipboard().setText(token_input.text()))
+
+        copy_connection_btn = QPushButton("复制手机连接信息")
+        copy_connection_btn.clicked.connect(self.copy_mobile_connection_package)
+
+        token_row = QHBoxLayout()
+        token_row.addWidget(token_input, 1)
+        token_row.addWidget(copy_token_btn)
+
+        token_options = QHBoxLayout()
+        token_options.addWidget(show_token_checkbox)
+        token_options.addStretch()
+
+        address_list = self.get_lan_ipv4_addresses()
+        address_text = "、".join(address_list) if address_list else "请查看 Windows 当前局域网 IP"
+        address_label = QLabel(address_text)
+        address_label.setWordWrap(True)
+
+        self.remote_service_status_label = QLabel("等待启动")
+        self.remote_service_status_label.setWordWrap(True)
+
+        apply_btn = QPushButton("应用并重启远程服务")
+        apply_btn.clicked.connect(self.restart_remote_control_server)
+        self.remote_enabled_checkbox.stateChanged.connect(lambda _state: self.restart_remote_control_server())
+
+        layout.addRow(self.remote_enabled_checkbox)
+        layout.addRow("监听端口:", self.remote_port_spin)
+        layout.addRow("访问令牌:", token_row)
+        layout.addRow("", token_options)
+        layout.addRow("", copy_connection_btn)
+        layout.addRow("电脑局域网 IP:", address_label)
+        layout.addRow("服务状态:", self.remote_service_status_label)
+        layout.addRow(apply_btn)
+        group.setLayout(layout)
+        return group
+
     def sync_scheduled_image_settings_from_ui(self, save=True):
         settings = self.config.setdefault("settings", {})
         if self.scheduled_folder_input is not None:
@@ -319,8 +758,7 @@ class MomoReplyGUI(QWidget):
                 {
                     "scheduled_image_start_hour": self.scheduled_start_hour.value(),
                     "scheduled_image_start_minute": self.scheduled_start_minute.value(),
-                    "scheduled_image_start_random_window_minutes": self.scheduled_start_random_spin.value(),
-                    "scheduled_image_min_lead_minutes": self.scheduled_min_lead_spin.value(),
+                    "scheduled_image_first_delay_minutes": self.scheduled_first_delay_spin.value(),
                     "scheduled_image_end_hour": self.scheduled_end_hour.value(),
                     "scheduled_image_end_minute": self.scheduled_end_minute.value(),
                 }
@@ -332,6 +770,12 @@ class MomoReplyGUI(QWidget):
                     "scheduled_image_random_window_minutes": self.scheduled_random_spin.value(),
                 }
             )
+        if self.scheduled_pause_on_contact_checkbox is not None:
+            settings["scheduled_image_pause_on_contact_message"] = (
+                self.scheduled_pause_on_contact_checkbox.isChecked()
+            )
+        if self.scheduled_resume_delay_spin is not None:
+            settings["scheduled_image_resume_delay_minutes"] = self.scheduled_resume_delay_spin.value()
         if hasattr(self, "enable_scheduled_image_sender"):
             settings["enable_scheduled_image_sender"] = self.enable_scheduled_image_sender.isChecked()
         if save:
@@ -417,6 +861,7 @@ class MomoReplyGUI(QWidget):
         return images
 
     def closeEvent(self, event):
+        self.stop_remote_control_server()
         if self.monitoring:
             self.stop_monitoring()
         if self.auto_timer is not None:
@@ -429,17 +874,10 @@ class MomoReplyGUI(QWidget):
         event.accept()
 
     def show_wechat_open_notice(self):
-        msg_box = QMessageBox(self)
-        msg_box.setIcon(QMessageBox.Information)
-        msg_box.setWindowTitle("重要提示")
-        msg_box.setText("微信自动化操作说明")
-        msg_box.setInformativeText(
-            "使用前请确认 Windows 讲述人模式已开启。\n"
-            "聊天窗口需要单独拖出，窗口标题要和“目标对话/触发者昵称”一致。\n"
-            "图片发送成功后会移动到素材目录下的 sent 文件夹。"
+        self.add_log(
+            "操作说明: 可使用“一键启动监控”自动准备讲述人、微信、"
+            "目标独立窗口和关键词监控；图片发送成功后会移动到素材目录下的 sent 文件夹。"
         )
-        msg_box.setStandardButtons(QMessageBox.Ok)
-        msg_box.exec_()
 
     def init_language_choose(self):
         def switch_language():
@@ -493,6 +931,46 @@ class MomoReplyGUI(QWidget):
             or self.refresh_runtime_status()
         )
         base_layout.addRow("目标对话/触发者昵称:", trigger_sender_input)
+
+        initial_wechat_path = settings_config.get("wechat_launch_path", "").strip()
+        if not initial_wechat_path or not Path(initial_wechat_path).is_file():
+            initial_wechat_path = self.get_wechat_launch_path()
+
+        wechat_path_widget = QWidget()
+        wechat_path_layout = QHBoxLayout(wechat_path_widget)
+        wechat_path_layout.setContentsMargins(0, 0, 0, 0)
+        self.wechat_launch_path_input = QLineEdit(initial_wechat_path)
+        self.wechat_launch_path_input.setPlaceholderText("选择微信程序或桌面快捷方式")
+        wechat_path_btn = QPushButton("选择文件")
+        wechat_path_btn.setFixedWidth(92)
+
+        def save_wechat_launch_path():
+            path = self.wechat_launch_path_input.text().strip().strip('"')
+            self.wechat_launch_path_input.setText(path)
+            self.config.setdefault("settings", {})["wechat_launch_path"] = path
+            self.save_config()
+
+        def browse_wechat_launch_path():
+            current_path = self.wechat_launch_path_input.text().strip()
+            start_dir = str(Path(current_path).parent) if Path(current_path).is_file() else str(Path.home() / "Desktop")
+            selected, _selected_filter = QFileDialog.getOpenFileName(
+                self,
+                "选择微信程序或快捷方式",
+                start_dir,
+                "微信程序或快捷方式 (*.exe *.lnk);;所有文件 (*)",
+            )
+            if not selected:
+                return
+            self.wechat_launch_path_input.setText(selected)
+            save_wechat_launch_path()
+            self.add_log(f"微信启动路径已保存: {selected}")
+
+        self.wechat_launch_path_input.editingFinished.connect(save_wechat_launch_path)
+        wechat_path_btn.clicked.connect(browse_wechat_launch_path)
+        wechat_path_layout.addWidget(self.wechat_launch_path_input, 1)
+        wechat_path_layout.addWidget(wechat_path_btn)
+        base_layout.addRow("微信启动路径:", wechat_path_widget)
+
         base_group.setLayout(base_layout)
         main_layout.addWidget(base_group)
 
@@ -802,21 +1280,18 @@ class MomoReplyGUI(QWidget):
         scheduled_window_group = QGroupBox("发送窗口")
         scheduled_window_layout = QFormLayout()
 
-        scheduled_start_hbox = QHBoxLayout()
+        scheduled_window_hbox = QHBoxLayout()
         self.scheduled_start_hour = QSpinBox()
         self.scheduled_start_hour.setRange(0, 23)
         self.scheduled_start_hour.setValue(settings_config.get("scheduled_image_start_hour", 9))
         self.scheduled_start_minute = QSpinBox()
         self.scheduled_start_minute.setRange(0, 59)
         self.scheduled_start_minute.setValue(settings_config.get("scheduled_image_start_minute", 0))
-        self.scheduled_start_random_spin = QSpinBox()
-        self.scheduled_start_random_spin.setRange(0, 720)
-        self.scheduled_start_random_spin.setValue(
-            settings_config.get("scheduled_image_start_random_window_minutes", 30)
+        self.scheduled_first_delay_spin = QSpinBox()
+        self.scheduled_first_delay_spin.setRange(0, 1440)
+        self.scheduled_first_delay_spin.setValue(
+            settings_config.get("scheduled_image_first_delay_minutes", 30)
         )
-        self.scheduled_min_lead_spin = QSpinBox()
-        self.scheduled_min_lead_spin.setRange(0, 120)
-        self.scheduled_min_lead_spin.setValue(settings_config.get("scheduled_image_min_lead_minutes", 10))
         self.scheduled_end_hour = QSpinBox()
         self.scheduled_end_hour.setRange(0, 23)
         self.scheduled_end_hour.setValue(settings_config.get("scheduled_image_end_hour", 23))
@@ -831,46 +1306,35 @@ class MomoReplyGUI(QWidget):
         for widget in [
             self.scheduled_start_hour,
             self.scheduled_start_minute,
-            self.scheduled_start_random_spin,
-            self.scheduled_min_lead_spin,
+            self.scheduled_first_delay_spin,
             self.scheduled_end_hour,
             self.scheduled_end_minute,
         ]:
             widget.valueChanged.connect(update_scheduled_time)
 
-        scheduled_start_hbox.addWidget(QLabel("首次发送:"))
-        scheduled_start_hbox.addWidget(self.scheduled_start_hour)
-        scheduled_start_hbox.addWidget(QLabel("时"))
-        scheduled_start_hbox.addWidget(self.scheduled_start_minute)
-        scheduled_start_hbox.addWidget(QLabel("分"))
-        scheduled_start_hbox.addStretch()
-        scheduled_window_layout.addRow(scheduled_start_hbox)
+        scheduled_window_hbox.addWidget(QLabel("从"))
+        scheduled_window_hbox.addWidget(self.scheduled_start_hour)
+        scheduled_window_hbox.addWidget(QLabel("时"))
+        scheduled_window_hbox.addWidget(self.scheduled_start_minute)
+        scheduled_window_hbox.addWidget(QLabel("分 到"))
+        scheduled_window_hbox.addWidget(self.scheduled_end_hour)
+        scheduled_window_hbox.addWidget(QLabel("时"))
+        scheduled_window_hbox.addWidget(self.scheduled_end_minute)
+        scheduled_window_hbox.addWidget(QLabel("分"))
+        scheduled_window_hbox.addStretch()
+        scheduled_window_layout.addRow("发送窗口:", scheduled_window_hbox)
 
-        scheduled_start_random_hbox = QHBoxLayout()
-        scheduled_start_random_hbox.addWidget(QLabel("首次随机浮动(分):"))
-        scheduled_start_random_hbox.addWidget(self.scheduled_start_random_spin)
-        scheduled_start_random_hbox.addStretch()
-        scheduled_window_layout.addRow(scheduled_start_random_hbox)
-
-        scheduled_min_lead_hbox = QHBoxLayout()
-        scheduled_min_lead_hbox.addWidget(QLabel("启用后最短等待(分):"))
-        scheduled_min_lead_hbox.addWidget(self.scheduled_min_lead_spin)
-        scheduled_min_lead_hbox.addStretch()
-        scheduled_window_layout.addRow(scheduled_min_lead_hbox)
-
-        scheduled_end_hbox = QHBoxLayout()
-        scheduled_end_hbox.addWidget(QLabel("停止发送:"))
-        scheduled_end_hbox.addWidget(self.scheduled_end_hour)
-        scheduled_end_hbox.addWidget(QLabel("时"))
-        scheduled_end_hbox.addWidget(self.scheduled_end_minute)
-        scheduled_end_hbox.addWidget(QLabel("分"))
-        scheduled_end_hbox.addStretch()
-        scheduled_window_layout.addRow(scheduled_end_hbox)
+        scheduled_first_delay_hbox = QHBoxLayout()
+        scheduled_first_delay_hbox.addWidget(QLabel("窗口开始后"))
+        scheduled_first_delay_hbox.addWidget(self.scheduled_first_delay_spin)
+        scheduled_first_delay_hbox.addWidget(QLabel("分钟发送第一次"))
+        scheduled_first_delay_hbox.addStretch()
+        scheduled_window_layout.addRow("首次延迟:", scheduled_first_delay_hbox)
 
         scheduled_window_group.setLayout(scheduled_window_layout)
         main_layout.addWidget(scheduled_window_group)
 
-        scheduled_interval_group = QGroupBox("循环发送")
+        scheduled_interval_group = QGroupBox("发送节奏")
         scheduled_interval_layout = QFormLayout()
 
         scheduled_interval_hbox = QHBoxLayout()
@@ -887,13 +1351,13 @@ class MomoReplyGUI(QWidget):
 
         self.scheduled_interval_spin.valueChanged.connect(update_scheduled_interval)
         self.scheduled_random_spin.valueChanged.connect(update_scheduled_interval)
-        scheduled_interval_hbox.addWidget(QLabel("间隔(分):"))
+        scheduled_interval_hbox.addWidget(QLabel("后续间隔(分):"))
         scheduled_interval_hbox.addWidget(self.scheduled_interval_spin)
         scheduled_interval_hbox.addStretch()
         scheduled_interval_layout.addRow(scheduled_interval_hbox)
 
         scheduled_random_hbox = QHBoxLayout()
-        scheduled_random_hbox.addWidget(QLabel("随机浮动(分):"))
+        scheduled_random_hbox.addWidget(QLabel("间隔随机浮动(分):"))
         scheduled_random_hbox.addWidget(self.scheduled_random_spin)
         scheduled_random_hbox.addStretch()
         scheduled_interval_layout.addRow(scheduled_random_hbox)
@@ -913,7 +1377,53 @@ class MomoReplyGUI(QWidget):
 
         scheduled_interval_group.setLayout(scheduled_interval_layout)
         main_layout.addWidget(scheduled_interval_group)
+
+        scheduled_guard_group = QGroupBox("会话保护")
+        scheduled_guard_layout = QFormLayout()
+        self.scheduled_pause_on_contact_checkbox = QCheckBox("对方新消息未回复时暂停定时发图")
+        self.scheduled_pause_on_contact_checkbox.setChecked(
+            settings_config.get("scheduled_image_pause_on_contact_message", True)
+        )
+        self.scheduled_resume_delay_spin = QSpinBox()
+        self.scheduled_resume_delay_spin.setRange(0, 120)
+        self.scheduled_resume_delay_spin.setValue(settings_config.get("scheduled_image_resume_delay_minutes", 5))
+        self.scheduled_mark_replied_btn = QPushButton("我已回复，恢复排程")
+
+        def update_scheduled_guard_options():
+            self.sync_scheduled_image_settings_from_ui()
+            if not self.scheduled_pause_on_contact_checkbox.isChecked():
+                self.clear_scheduled_conversation_guard("会话保护已关闭", reset_schedule=False)
+            self._update_scheduled_image_status()
+
+        self.scheduled_pause_on_contact_checkbox.stateChanged.connect(lambda _state: update_scheduled_guard_options())
+        self.scheduled_resume_delay_spin.valueChanged.connect(lambda _value: update_scheduled_guard_options())
+        self.scheduled_mark_replied_btn.clicked.connect(
+            lambda: self.mark_scheduled_conversation_replied(manual=True)
+        )
+
+        scheduled_guard_delay_hbox = QHBoxLayout()
+        scheduled_guard_delay_hbox.addWidget(QLabel("回复后等待(分):"))
+        scheduled_guard_delay_hbox.addWidget(self.scheduled_resume_delay_spin)
+        scheduled_guard_delay_hbox.addStretch()
+
+        scheduled_guard_layout.addRow(self.scheduled_pause_on_contact_checkbox)
+        scheduled_guard_layout.addRow(scheduled_guard_delay_hbox)
+        scheduled_guard_layout.addRow(self.scheduled_mark_replied_btn)
+        scheduled_guard_group.setLayout(scheduled_guard_layout)
+        main_layout.addWidget(scheduled_guard_group)
+
+        calculation_group = QGroupBox("排程计算")
+        calculation_layout = QVBoxLayout()
+        self.scheduled_image_calculation_label = QLabel()
+        self.scheduled_image_calculation_label.setObjectName("scheduleCalculation")
+        self.scheduled_image_calculation_label.setWordWrap(True)
+        self.scheduled_image_calculation_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        calculation_layout.addWidget(self.scheduled_image_calculation_label)
+        calculation_group.setLayout(calculation_layout)
+        main_layout.addWidget(calculation_group)
+
         refresh_scheduled_count()
+        self._update_scheduled_image_calculation()
         main_layout.addStretch()
 
         return main_layout
@@ -925,12 +1435,14 @@ class MomoReplyGUI(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(8)
         rows = [
+            ("one_click", "一键监控", "待启动"),
             ("monitor", "监控状态", "未启动"),
             ("narrator", "讲述人", "未检查"),
             ("target", "目标窗口", "未检查"),
             ("last_message", "最后消息", "-"),
             ("last_trigger", "最近触发", "-"),
             ("delay", "延时发送", "空闲"),
+            ("conversation_guard", "会话保护", "未触发"),
             ("timed_send", "定时发图", "未启用"),
             ("send_result", "发送结果", "-"),
         ]
@@ -1024,6 +1536,7 @@ class MomoReplyGUI(QWidget):
                 pass
 
     def set_status(self, key, value):
+        self.status_values[key] = str(value)
         self.status_signal.emit(key, str(value))
 
     def _do_update_status(self, key, value):
@@ -1038,16 +1551,30 @@ class MomoReplyGUI(QWidget):
         self.refresh_runtime_status()
 
     def refresh_runtime_status(self):
+        self.handle_activation_request()
         self.set_status("monitor", "运行中" if self.monitoring else "未启动")
         self.set_status("narrator", self.get_narrator_status_text())
         target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
         result = self.wechat.check_target_window(target_name)
         self.set_status("target", result.message)
+        self._update_conversation_guard_status()
+        self.update_scheduled_calculation_signal.emit()
+
+    def handle_activation_request(self):
+        if not self.activation_request_path.exists():
+            return
+        try:
+            self.activation_request_path.unlink()
+        except OSError:
+            return
+        self.bring_main_window_to_front()
 
     def run_startup_check(self):
         self.add_log("开始启动自检")
+        check_issues = []
         for note in self.config_load_notes:
             self.add_log(note)
+            check_issues.append(note)
 
         dependency_checks = [
             ("PyQt5", "PyQt5"),
@@ -1060,7 +1587,9 @@ class MomoReplyGUI(QWidget):
                 __import__(module_name)
                 self.add_log(f"依赖正常: {name}")
             except Exception as exc:
-                self.add_log(f"依赖异常: {name} - {exc}")
+                message = f"依赖异常: {name} - {exc}"
+                self.add_log(message)
+                check_issues.append(message)
 
         self.add_log(f"Windows 讲述人状态: {self.get_narrator_status_text()}")
         self.add_log("请确认 Windows 讲述人模式已开启，否则微信控件可能无法识别")
@@ -1068,25 +1597,36 @@ class MomoReplyGUI(QWidget):
         target_result = self.wechat.check_target_window(target_name)
         self.set_status("target", target_result.message)
         self.add_log(target_result.message)
+        if getattr(target_result, "success", True) is False:
+            check_issues.append(target_result.message)
 
         active_count = self.config.get("settings", {}).get("active_rules_count", 1)
         for index in range(active_count):
             rule = self.config["rules"][index]
             keywords = [item.strip() for item in rule.get("keywords", "").split(",") if item.strip()]
             if not keywords:
-                self.add_log(f"规则 {index + 1} 未配置关键词")
+                message = f"规则 {index + 1} 未配置关键词"
+                self.add_log(message)
+                check_issues.append(message)
             if rule.get("reply_type") == "image":
                 folder = rule.get("folder", "").strip()
                 if not folder:
-                    self.add_log(f"规则 {index + 1} 未配置图片目录")
+                    message = f"规则 {index + 1} 未配置图片目录"
+                    self.add_log(message)
+                    check_issues.append(message)
                 elif self.get_folder_access_message(folder):
-                    self.add_log(f"规则 {index + 1} {self.get_folder_access_message(folder)}")
+                    message = f"规则 {index + 1} {self.get_folder_access_message(folder)}"
+                    self.add_log(message)
+                    check_issues.append(message)
                 else:
                     self.add_log(f"规则 {index + 1} 图片数量: {len(self.get_valid_images(folder))}")
             else:
                 if not rule.get("reply_text", "").strip():
-                    self.add_log(f"规则 {index + 1} 未配置回复文本")
+                    message = f"规则 {index + 1} 未配置回复文本"
+                    self.add_log(message)
+                    check_issues.append(message)
 
+        self.last_startup_check_summary = "正常" if not check_issues else "；".join(check_issues[:3])
         self.add_log("启动自检完成")
 
     def _do_update_img_count(self, rule_idx):
@@ -1158,14 +1698,199 @@ class MomoReplyGUI(QWidget):
 
         return int(actual_delay * 60), actual_delay
 
-    def on_last_message_change(self, last_text, _current_time):
+    def _message_direction_label(self, direction):
+        return {
+            "contact": "对方",
+            "assumed_contact": "未知/按对方",
+            "self": "我",
+            "unknown": "未知",
+        }.get(direction or "unknown", "未知")
+
+    def _mark_expected_self_message(self, seconds=12):
+        with self.conversation_guard_lock:
+            self.expected_self_message_until = datetime.datetime.now() + datetime.timedelta(seconds=seconds)
+
+    def _consume_expected_self_message(self):
+        now = datetime.datetime.now()
+        with self.conversation_guard_lock:
+            expected_until = self.expected_self_message_until
+            if expected_until is None:
+                return False
+            if now <= expected_until:
+                self.expected_self_message_until = None
+                return True
+            self.expected_self_message_until = None
+        return False
+
+    def _clear_expected_self_message(self):
+        with self.conversation_guard_lock:
+            self.expected_self_message_until = None
+
+    def _resolve_message_direction(self, clean_text, direction):
+        if direction == "self":
+            self._clear_expected_self_message()
+            return direction
+        if direction == "contact":
+            return direction
+        if not clean_text:
+            return "unknown"
+        if self._consume_expected_self_message():
+            return "self"
+        if self._scheduled_conversation_guard_enabled():
+            return "assumed_contact"
+        return "unknown"
+
+    def _scheduled_conversation_guard_enabled(self):
+        return bool(
+            self.config.get("settings", {}).get("scheduled_image_pause_on_contact_message", True)
+        )
+
+    def _get_scheduled_resume_delay_minutes(self):
+        try:
+            value = int(self.config.get("settings", {}).get("scheduled_image_resume_delay_minutes", 5))
+        except (TypeError, ValueError):
+            value = 5
+        return max(0, min(120, value))
+
+    def _schedule_after_conversation_reply(self, now, resume_after):
+        if not self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
+            return
+
+        schedule_at = resume_after or now
+        if self.scheduled_image_next_at is not None and self.scheduled_image_next_at > schedule_at:
+            self._update_scheduled_image_status()
+            return
+
+        start, end = self._get_scheduled_image_window(now)
+        active_start = self._get_scheduled_image_active_start(start)
+        if schedule_at < active_start:
+            schedule_at = active_start
+        if schedule_at >= end:
+            self.pause_scheduled_image_sender_signal.emit(
+                "回复后已超过今天可安排时间，定时主动发图已暂停；明天需要手动启用"
+            )
+            return
+
+        self.scheduled_image_schedule_mode = "conversation_resume"
+        self.scheduled_image_schedule_base_at = now
+        self.scheduled_image_next_at = schedule_at
+        self._update_scheduled_image_status()
+        self.add_log(f"会话已回复，定时发图恢复到: {schedule_at:%Y-%m-%d %H:%M}")
+
+    def _get_scheduled_conversation_block_reason(self, now=None):
+        if not self._scheduled_conversation_guard_enabled():
+            return ""
+
+        now = now or datetime.datetime.now()
+        with self.conversation_guard_lock:
+            if self.scheduled_image_waiting_for_reply:
+                return "等待人工回复"
+            if self.scheduled_image_resume_after is not None:
+                if now < self.scheduled_image_resume_after:
+                    return f"回复后等待到 {self.scheduled_image_resume_after:%H:%M}"
+                self.scheduled_image_resume_after = None
+        return ""
+
+    def _update_conversation_guard_status(self):
+        if not self._scheduled_conversation_guard_enabled():
+            self.set_status("conversation_guard", "未启用")
+            return
+
+        reason = self._get_scheduled_conversation_block_reason()
+        if reason:
+            self.set_status("conversation_guard", reason)
+        else:
+            self.set_status("conversation_guard", "未触发")
+
+    def _mark_scheduled_contact_message_pending(self, clean_text):
+        if not self._scheduled_conversation_guard_enabled():
+            return
+
+        now = datetime.datetime.now()
+        with self.conversation_guard_lock:
+            was_waiting = self.scheduled_image_waiting_for_reply
+            previous_text = self.scheduled_image_waiting_text
+            self.scheduled_image_waiting_for_reply = True
+            self.scheduled_image_waiting_text = clean_text
+            self.scheduled_image_waiting_since = now
+            self.scheduled_image_resume_after = None
+
+        if not was_waiting or previous_text != clean_text:
+            self.add_log(f"检测到对方新消息，定时发图进入等待人工回复: {clean_text}")
+        self._update_scheduled_image_status()
+
+    def mark_scheduled_conversation_replied(self, manual=False):
+        if not self._scheduled_conversation_guard_enabled():
+            if manual:
+                self.add_log("会话保护未启用，无需恢复")
+            self._update_conversation_guard_status()
+            return
+
+        now = datetime.datetime.now()
+        delay_minutes = self._get_scheduled_resume_delay_minutes()
+        resume_after = now + datetime.timedelta(minutes=delay_minutes) if delay_minutes > 0 else None
+        with self.conversation_guard_lock:
+            had_state = (
+                self.scheduled_image_waiting_for_reply
+                or self.scheduled_image_resume_after is not None
+                or self.scheduled_image_deferred_due_at is not None
+            )
+            self.scheduled_image_waiting_for_reply = False
+            self.scheduled_image_waiting_text = ""
+            self.scheduled_image_waiting_since = None
+            self.scheduled_image_resume_after = resume_after if had_state else None
+            self.scheduled_image_deferred_due_at = None
+
+        if had_state:
+            if delay_minutes > 0:
+                self.add_log(f"检测到已回复，定时发图将在 {delay_minutes} 分钟后恢复")
+            else:
+                self.add_log("检测到已回复，定时发图立即恢复")
+            self._schedule_after_conversation_reply(now, resume_after)
+        elif manual:
+            self.add_log("当前没有待回复消息，已刷新会话保护状态")
+
+        self._update_conversation_guard_status()
+
+    def clear_scheduled_conversation_guard(self, reason="", reset_schedule=True):
+        with self.conversation_guard_lock:
+            had_state = (
+                self.scheduled_image_waiting_for_reply
+                or self.scheduled_image_resume_after is not None
+                or self.scheduled_image_deferred_due_at is not None
+            )
+            self.scheduled_image_waiting_for_reply = False
+            self.scheduled_image_waiting_text = ""
+            self.scheduled_image_waiting_since = None
+            self.scheduled_image_resume_after = None
+            self.scheduled_image_deferred_due_at = None
+            self.expected_self_message_until = None
+
+        if had_state and reason:
+            self.add_log(reason)
+        if reset_schedule and self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
+            self.reset_scheduled_image_next_send()
+        else:
+            self._update_scheduled_image_status()
+        self._update_conversation_guard_status()
+
+    def _handle_scheduled_conversation_message(self, clean_text, direction):
+        if direction in ("contact", "assumed_contact"):
+            self._mark_scheduled_contact_message_pending(clean_text)
+        elif direction == "self":
+            self.mark_scheduled_conversation_replied(manual=False)
+
+    def on_last_message_change(self, last_text, _current_time, message_direction="unknown"):
         settings_config = self.config.get("settings", {})
         trigger_sender = settings_config.get("trigger_sender", "momo")
         active_count = settings_config.get("active_rules_count", 1)
 
         clean_text = str(last_text).strip()
-        self.set_status("last_message", clean_text or "-")
-        matched_rule_idx = self._find_matching_rule_index(clean_text, active_count)
+        direction = self._resolve_message_direction(clean_text, message_direction or "unknown")
+        direction_label = self._message_direction_label(direction)
+        self.set_status("last_message", f"{direction_label}: {clean_text}" if clean_text else "-")
+        self._handle_scheduled_conversation_message(clean_text, direction)
+        matched_rule_idx = -1 if direction == "self" else self._find_matching_rule_index(clean_text, active_count)
 
         if matched_rule_idx != -1:
             trigger_token = self._try_activate_trigger()
@@ -1267,8 +1992,10 @@ class MomoReplyGUI(QWidget):
                 selected_image = random.choice(images)
                 self.add_log(f"已抽取图片: {os.path.basename(selected_image)}")
 
+                self._mark_expected_self_message()
                 result = self.wechat.send_file(trigger_sender, selected_image)
                 if not result:
+                    self._clear_expected_self_message()
                     self.set_status("send_result", f"失败: {result.message}")
                     self.add_log(f"图片发送失败: {result.message}")
                     return
@@ -1287,8 +2014,10 @@ class MomoReplyGUI(QWidget):
                     return
 
                 self.add_log("准备发送文本")
+                self._mark_expected_self_message()
                 result = self.wechat.send_msg(trigger_sender, text=reply_text)
                 if not result:
+                    self._clear_expected_self_message()
                     self.set_status("send_result", f"失败: {result.message}")
                     self.add_log(f"文本发送失败: {result.message}")
                     return
@@ -1303,10 +2032,52 @@ class MomoReplyGUI(QWidget):
             self.set_status("delay", "空闲")
             self._finish_trigger(trigger_token)
 
-    def start_monitoring(self):
-        if self.monitoring:
-            QMessageBox.information(self, "提示", "监控已经在运行中")
+    def open_target_chat_window(self):
+        if self.open_target_window_active:
             return
+
+        target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
+        if not target_name:
+            QMessageBox.warning(self, "目标联系人为空", "请先填写“目标对话/触发者昵称”。")
+            return
+
+        self.open_target_window_active = True
+        if self.open_target_window_btn is not None:
+            self.open_target_window_btn.setEnabled(False)
+            self.open_target_window_btn.setText("正在查找联系人...")
+        self.set_status("target", f"正在查找联系人: {target_name}")
+        self.add_log(f"开始查找联系人并打开独立窗口: {target_name}")
+        threading.Thread(
+            target=self._open_target_chat_window_worker,
+            args=(target_name,),
+            daemon=True,
+        ).start()
+
+    def _open_target_chat_window_worker(self, target_name):
+        _uia_init = auto.UIAutomationInitializerInThread()
+        try:
+            result = self.wechat.open_independent_chat_window(target_name)
+            self.target_window_action_finished_signal.emit(bool(result), result.message)
+        except Exception as exc:
+            self.target_window_action_finished_signal.emit(False, f"打开目标聊天窗口异常: {exc}")
+        finally:
+            _uia_init = None
+
+    def _finish_open_target_window(self, success, message):
+        self.open_target_window_active = False
+        if self.open_target_window_btn is not None:
+            self.open_target_window_btn.setEnabled(True)
+            self.open_target_window_btn.setText("打开并置顶目标窗口")
+        self.set_status("target", message)
+        self.add_log(message)
+        if not success:
+            QMessageBox.warning(self, "打开目标窗口失败", message)
+
+    def start_monitoring(self, silent=False):
+        if self.monitoring:
+            if not silent:
+                QMessageBox.information(self, "提示", "监控已经在运行中")
+            return True
 
         start_time = time.strftime("%Y-%m-%d %H:%M:%S")
         self.add_log(f"[{start_time}] 启动精准多重规则监控")
@@ -1322,12 +2093,13 @@ class MomoReplyGUI(QWidget):
 
         if not result:
             self.add_log(result.message)
-            return
+            return False
 
         self.monitoring = True
         self.set_status("monitor", "运行中")
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
+        return True
 
     def stop_monitoring(self):
         if self.monitoring:
@@ -1375,6 +2147,7 @@ class MomoReplyGUI(QWidget):
             self.stop_monitoring()
 
     def start_scheduled_image_sender(self):
+        self.scheduled_image_pause_reason = ""
         if self.scheduled_image_timer is None:
             self.scheduled_image_timer = QTimer(self)
             self.scheduled_image_timer.timeout.connect(self.check_scheduled_image_send)
@@ -1388,13 +2161,59 @@ class MomoReplyGUI(QWidget):
             self.scheduled_image_timer.stop()
             self.scheduled_image_timer = None
         self.scheduled_image_next_at = None
+        self.scheduled_image_schedule_mode = None
+        self.scheduled_image_schedule_base_at = None
+        self.scheduled_image_pause_reason = ""
+        with self.conversation_guard_lock:
+            self.scheduled_image_waiting_for_reply = False
+            self.scheduled_image_waiting_text = ""
+            self.scheduled_image_waiting_since = None
+            self.scheduled_image_resume_after = None
+            self.scheduled_image_deferred_due_at = None
+            self.expected_self_message_until = None
         self.set_status("timed_send", "未启用")
+        self._update_conversation_guard_status()
+        self.update_scheduled_calculation_signal.emit()
         self.add_log("定时主动发图已关闭")
+
+    def _pause_scheduled_image_sender(self, reason):
+        was_enabled = self.config.get("settings", {}).get("enable_scheduled_image_sender", False)
+        self.config.setdefault("settings", {})["enable_scheduled_image_sender"] = False
+        self.save_config()
+        if self.scheduled_image_timer is not None:
+            self.scheduled_image_timer.stop()
+            self.scheduled_image_timer = None
+        self.scheduled_image_next_at = None
+        self.scheduled_image_schedule_mode = None
+        self.scheduled_image_schedule_base_at = None
+        self.scheduled_image_pause_reason = reason
+        with self.conversation_guard_lock:
+            self.scheduled_image_waiting_for_reply = False
+            self.scheduled_image_waiting_text = ""
+            self.scheduled_image_waiting_since = None
+            self.scheduled_image_resume_after = None
+            self.scheduled_image_deferred_due_at = None
+            self.expected_self_message_until = None
+        if hasattr(self, "enable_scheduled_image_sender"):
+            was_blocked = self.enable_scheduled_image_sender.blockSignals(True)
+            self.enable_scheduled_image_sender.setChecked(False)
+            self.enable_scheduled_image_sender.blockSignals(was_blocked)
+        self.set_status("timed_send", "已暂停")
+        self._update_conversation_guard_status()
+        self.update_scheduled_calculation_signal.emit()
+        if was_enabled:
+            self.add_log(reason)
 
     def reset_scheduled_image_next_send(self):
         if not self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
             return
-        self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(datetime.datetime.now())
+        now = datetime.datetime.now()
+        self.scheduled_image_schedule_mode = "initial"
+        self.scheduled_image_schedule_base_at = now
+        self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(now)
+        if self.scheduled_image_next_at is None:
+            self._pause_scheduled_image_sender("今天已超过定时发图可安排时间，已暂停；明天需要手动启用")
+            return
         self._update_scheduled_image_status()
 
     def _get_scheduled_image_window(self, now):
@@ -1427,53 +2246,27 @@ class MomoReplyGUI(QWidget):
         return start + datetime.timedelta(days=1)
 
     def _get_scheduled_image_active_start(self, start):
-        settings_config = self.config.get("settings", {})
-        random_window = max(0, int(settings_config.get("scheduled_image_start_random_window_minutes", 0)))
-        return start - datetime.timedelta(minutes=random_window)
+        return start
 
-    def _get_randomized_first_due_time(self, start, end, earliest_at=None):
-        settings_config = self.config.get("settings", {})
-        random_window = max(0, int(settings_config.get("scheduled_image_start_random_window_minutes", 0)))
-        active_start = self._get_scheduled_image_active_start(start)
-        earliest_due = active_start
-        if earliest_at is not None:
-            earliest_due = max(earliest_due, earliest_at)
-
-        latest_due = min(start + datetime.timedelta(minutes=random_window), end - datetime.timedelta(seconds=5))
-        if latest_due < earliest_due:
-            return ""
-
-        span_seconds = int((latest_due - earliest_due).total_seconds())
-        offset_seconds = random.randint(0, max(0, span_seconds))
-        return earliest_due + datetime.timedelta(seconds=offset_seconds)
+    def _get_scheduled_first_delay_minutes(self):
+        try:
+            value = int(self.config.get("settings", {}).get("scheduled_image_first_delay_minutes", 30))
+        except (TypeError, ValueError):
+            value = 30
+        return max(0, min(1440, value))
 
     def _get_initial_scheduled_image_due_time(self, now):
-        settings_config = self.config.get("settings", {})
-        min_lead_minutes = max(0, int(settings_config.get("scheduled_image_min_lead_minutes", 0)))
-        earliest_at = now + datetime.timedelta(minutes=min_lead_minutes)
         start, end = self._get_scheduled_image_window(now)
+        first_due = start + datetime.timedelta(minutes=self._get_scheduled_first_delay_minutes())
+        latest_due = end - datetime.timedelta(seconds=5)
 
+        if first_due > latest_due:
+            return None
+        if now <= first_due:
+            return first_due
         if now < end:
-            due_time = self._get_randomized_first_due_time(start, end, earliest_at=earliest_at)
-            if due_time:
-                return due_time
-            latest_same_window_due = end - datetime.timedelta(seconds=5)
-            if earliest_at <= latest_same_window_due:
-                return earliest_at
-            next_start = start + datetime.timedelta(days=1)
-            next_end = end + datetime.timedelta(days=1)
-            return self._get_randomized_first_due_time(next_start, next_end)
-
-        next_start = self._get_next_scheduled_image_window_start(now)
-        next_end = next_start.replace(
-            hour=self.config.get("settings", {}).get("scheduled_image_end_hour", 23),
-            minute=self.config.get("settings", {}).get("scheduled_image_end_minute", 0),
-            second=0,
-            microsecond=0,
-        )
-        if next_end <= next_start:
-            next_end += datetime.timedelta(days=1)
-        return self._get_randomized_first_due_time(next_start, next_end)
+            return now
+        return None
 
     def _get_next_scheduled_image_due_time(self, now):
         settings_config = self.config.get("settings", {})
@@ -1487,29 +2280,120 @@ class MomoReplyGUI(QWidget):
         due_time = now + datetime.timedelta(minutes=offset_minutes)
         _start, end = self._get_scheduled_image_window(now)
         if due_time >= end:
-            next_start = self._get_next_scheduled_image_window_start(now)
-            next_end = next_start.replace(
-                hour=self.config.get("settings", {}).get("scheduled_image_end_hour", 23),
-                minute=self.config.get("settings", {}).get("scheduled_image_end_minute", 0),
-                second=0,
-                microsecond=0,
-            )
-            if next_end <= next_start:
-                next_end += datetime.timedelta(days=1)
-            return self._get_randomized_first_due_time(next_start, next_end)
+            return None
         return due_time
+
+    def _build_scheduled_image_calculation_text(self, now=None):
+        now = now or datetime.datetime.now()
+        settings = self.config.get("settings", {})
+        start, end = self._get_scheduled_image_window(now)
+        first_delay = self._get_scheduled_first_delay_minutes()
+        first_due = start + datetime.timedelta(minutes=first_delay)
+        interval = max(1, int(settings.get("scheduled_image_interval_minutes", 60)))
+        interval_random = max(0, int(settings.get("scheduled_image_random_window_minutes", 0)))
+        minimum_interval = max(1, interval - interval_random)
+        maximum_interval = max(1, interval + interval_random)
+
+        lines = [
+            f"当前时间：{now:%m-%d %H:%M}",
+            f"发送窗口：{start:%m-%d %H:%M} 至 {end:%m-%d %H:%M}",
+            f"首次规则：窗口开始后 {first_delay} 分钟，固定为 {first_due:%m-%d %H:%M}",
+            f"后续规则：每次成功发送后 {interval} ± {interval_random} 分钟，"
+            f"即 {minimum_interval} 至 {maximum_interval} 分钟",
+        ]
+
+        pause_reason = getattr(self, "scheduled_image_pause_reason", "")
+        enabled = settings.get("enable_scheduled_image_sender", False)
+        next_at = getattr(self, "scheduled_image_next_at", None)
+        mode = getattr(self, "scheduled_image_schedule_mode", None)
+        base_at = getattr(self, "scheduled_image_schedule_base_at", None)
+        guard_reason = self._get_scheduled_conversation_block_reason(now)
+        with self.conversation_guard_lock:
+            deferred_due_at = self.scheduled_image_deferred_due_at
+
+        if pause_reason:
+            lines.append(f"计算结果：无法在停止时间前完成等待，已暂停")
+            lines.append(f"原因：{pause_reason}")
+        elif not enabled:
+            lines.append("当前状态：未启用，勾选后按上方规则计算")
+        elif guard_reason:
+            lines.append(f"会话保护：{guard_reason}")
+            if deferred_due_at is not None:
+                lines.append(f"原计划发送：{deferred_due_at:%m-%d %H:%M}，已延后到回复后恢复")
+        elif next_at is None:
+            lines.append("当前状态：正在发送或等待重新计算")
+        elif mode == "interval" and base_at is not None:
+            actual_minutes = max(1, round((next_at - base_at).total_seconds() / 60))
+            lines.extend(
+                [
+                    "当前模式：后续循环",
+                    f"间隔范围：{interval} ± {interval_random} 分钟 = "
+                    f"{minimum_interval} 至 {maximum_interval} 分钟",
+                    f"本次随机结果：{actual_minutes} 分钟",
+                    f"计算过程：{base_at:%m-%d %H:%M} + {actual_minutes} 分钟 "
+                    f"= {next_at:%m-%d %H:%M}",
+                    f"最终结果：下一次发送 {next_at:%m-%d %H:%M}",
+                ]
+            )
+        elif mode == "conversation_resume" and base_at is not None:
+            wait_minutes = max(0, round((next_at - base_at).total_seconds() / 60))
+            lines.extend(
+                [
+                    f"会话恢复：{base_at:%m-%d %H:%M} 已检测到回复",
+                    f"回复后等待：{wait_minutes} 分钟",
+                    f"最终结果：下一次发送 {next_at:%m-%d %H:%M}",
+                ]
+            )
+        else:
+            base_at = base_at or now
+            next_min_at = next_at + datetime.timedelta(minutes=minimum_interval)
+            next_max_at = next_at + datetime.timedelta(minutes=maximum_interval)
+            lines.extend(
+                [
+                    "当前模式：首次发送",
+                    f"首次计算：{start:%m-%d %H:%M} + {first_delay} 分钟 "
+                    f"= {first_due:%m-%d %H:%M}",
+                ]
+            )
+            if first_due < base_at:
+                lines.append("首次时间已过：本次启用后立即安排一次")
+            lines.append(
+                f"下轮预览：首次成功后约 {next_min_at:%m-%d %H:%M} 至 "
+                f"{min(next_max_at, end):%m-%d %H:%M}"
+            )
+            lines.append(f"最终结果：下一次发送 {next_at:%m-%d %H:%M}")
+
+        lines.append(f"停止规则：到 {end:%m-%d %H:%M} 自动暂停，次日需手动启用")
+        return "\n".join(lines)
+
+    def _update_scheduled_image_calculation(self):
+        label = getattr(self, "scheduled_image_calculation_label", None)
+        if label is not None:
+            label.setText(self._build_scheduled_image_calculation_text())
 
     def _update_scheduled_image_status(self):
         if not self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
             self.set_status("timed_send", "未启用")
+            self._update_conversation_guard_status()
+            self.update_scheduled_calculation_signal.emit()
+            return
+        guard_reason = self._get_scheduled_conversation_block_reason()
+        if guard_reason:
+            self.set_status("timed_send", guard_reason)
+            self._update_conversation_guard_status()
+            self.update_scheduled_calculation_signal.emit()
             return
         if self.scheduled_image_sending:
             self.set_status("timed_send", "发送中")
+            self._update_conversation_guard_status()
+            self.update_scheduled_calculation_signal.emit()
             return
         if self.scheduled_image_next_at:
             self.set_status("timed_send", f"下次 {self.scheduled_image_next_at:%m-%d %H:%M}")
         else:
             self.set_status("timed_send", "待安排")
+        self._update_conversation_guard_status()
+        self.update_scheduled_calculation_signal.emit()
 
     def check_scheduled_image_send(self):
         settings_config = self.config.get("settings", {})
@@ -1522,14 +2406,49 @@ class MomoReplyGUI(QWidget):
         now = datetime.datetime.now()
         start, end = self._get_scheduled_image_window(now)
         active_start = self._get_scheduled_image_active_start(start)
+        if now >= end:
+            self._pause_scheduled_image_sender("已超过停止发送时间，定时主动发图已暂停；明天需要手动启用")
+            return
         if not (active_start <= now < end):
             if self.scheduled_image_next_at is None or self.scheduled_image_next_at <= now:
+                self.scheduled_image_schedule_mode = "initial"
+                self.scheduled_image_schedule_base_at = now
                 self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(now)
+                if self.scheduled_image_next_at is None:
+                    self._pause_scheduled_image_sender("今天已超过定时发图可安排时间，已暂停；明天需要手动启用")
+                    return
+            self._update_scheduled_image_status()
+            return
+
+        guard_reason = self._get_scheduled_conversation_block_reason(now)
+        if guard_reason:
+            if self.scheduled_image_next_at is not None and now >= self.scheduled_image_next_at:
+                due_time = self.scheduled_image_next_at
+                self.scheduled_image_next_at = None
+                with self.conversation_guard_lock:
+                    self.scheduled_image_deferred_due_at = due_time
+                self.add_log(f"定时发图到点，但{guard_reason}，已等待你回复后恢复")
             self._update_scheduled_image_status()
             return
 
         if self.scheduled_image_next_at is None:
+            self.scheduled_image_schedule_mode = "initial"
+            self.scheduled_image_schedule_base_at = now
             self.scheduled_image_next_at = self._get_initial_scheduled_image_due_time(now)
+            if self.scheduled_image_next_at is None:
+                self._pause_scheduled_image_sender("今天已超过定时发图可安排时间，已暂停；明天需要手动启用")
+                return
+            self._update_scheduled_image_status()
+            return
+
+        guard_reason = self._get_scheduled_conversation_block_reason(now)
+        if guard_reason:
+            if now >= self.scheduled_image_next_at:
+                due_time = self.scheduled_image_next_at
+                self.scheduled_image_next_at = None
+                with self.conversation_guard_lock:
+                    self.scheduled_image_deferred_due_at = due_time
+                self.add_log(f"定时发图到点，但{guard_reason}，已等待你回复后恢复")
             self._update_scheduled_image_status()
             return
 
@@ -1569,8 +2488,10 @@ class MomoReplyGUI(QWidget):
 
             selected_image = random.choice(images)
             self.add_log(f"定时发图已抽取图片: {os.path.basename(selected_image)}")
+            self._mark_expected_self_message()
             result = self.wechat.send_file(trigger_sender, selected_image)
             if not result:
+                self._clear_expected_self_message()
                 self.set_status("send_result", f"失败: {result.message}")
                 self.add_log(f"定时发图失败: {result.message}")
                 return
@@ -1586,9 +2507,17 @@ class MomoReplyGUI(QWidget):
         finally:
             self.scheduled_image_sending = False
             if self.config.get("settings", {}).get("enable_scheduled_image_sender", False):
-                self.scheduled_image_next_at = self._get_next_scheduled_image_due_time(datetime.datetime.now())
-                self._update_scheduled_image_status()
-                self.add_log(f"下一次定时发图已安排: {self.scheduled_image_next_at:%Y-%m-%d %H:%M}")
+                schedule_base = datetime.datetime.now()
+                self.scheduled_image_schedule_mode = "interval"
+                self.scheduled_image_schedule_base_at = schedule_base
+                self.scheduled_image_next_at = self._get_next_scheduled_image_due_time(schedule_base)
+                if self.scheduled_image_next_at is None:
+                    self.pause_scheduled_image_sender_signal.emit(
+                        "本次发送完成后已超过今天可安排时间，定时主动发图已暂停；明天需要手动启用"
+                    )
+                else:
+                    self._update_scheduled_image_status()
+                    self.add_log(f"下一次定时发图已安排: {self.scheduled_image_next_at:%Y-%m-%d %H:%M}")
             _uia_init = None
 
     def _get_windows_system_tool(self, exe_name):
@@ -1694,6 +2623,450 @@ class MomoReplyGUI(QWidget):
         except Exception as exc:
             self.add_log(f"关闭 Windows 讲述人失败: {exc}")
             QMessageBox.warning(self, "关闭失败", f"关闭 Windows 讲述人失败:\n{exc}")
+
+    def _get_wechat_process_ids(self):
+        if os.name != "nt":
+            return set()
+
+        tasklist_exe = self._get_windows_system_tool("tasklist.exe")
+        process_ids = set()
+        for image_name in ("Weixin.exe", "WeChat.exe"):
+            result = self._run_hidden_command(
+                [tasklist_exe, "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
+                timeout=5,
+            )
+            if result.returncode != 0:
+                continue
+            for row in csv.reader(result.stdout.splitlines()):
+                if len(row) < 2 or row[0].strip().lower() != image_name.lower():
+                    continue
+                try:
+                    process_ids.add(int(row[1].replace(",", "").strip()))
+                except ValueError:
+                    continue
+        return process_ids
+
+    def _is_wechat_control_tree_ready(self):
+        process_ids = self._get_wechat_process_ids()
+        if not process_ids:
+            return False, "等待微信进程出现"
+
+        try:
+            root = auto.GetRootControl()
+            top_level_controls = root.GetChildren()
+        except Exception as exc:
+            return False, f"读取控件树失败: {exc}"
+
+        for control in top_level_controls:
+            try:
+                process_id = int(getattr(control, "ProcessId", 0) or 0)
+                if process_id not in process_ids:
+                    continue
+                children = control.GetChildren()
+                if children:
+                    name = str(getattr(control, "Name", "") or "微信")
+                    return True, f"已识别微信控件树: {name}"
+            except Exception:
+                continue
+        return False, "微信进程已启动，等待 UIAutomation 控件树"
+
+    def start_one_click_wechat(self):
+        if self.one_click_run_active:
+            return
+        if self.monitoring:
+            QMessageBox.information(self, "监控已启动", "关键词监控已经在运行中。")
+            return
+        if os.name != "nt":
+            QMessageBox.warning(self, "不可用", "一键启动监控仅支持 Windows。")
+            return
+
+        target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
+        if not target_name:
+            QMessageBox.warning(self, "目标联系人为空", "请先填写“目标对话/触发者昵称”。")
+            return
+
+        if self.wechat_launch_path_input is not None:
+            configured_path = self.wechat_launch_path_input.text().strip().strip('"')
+            self.config.setdefault("settings", {})["wechat_launch_path"] = configured_path
+            self.save_config()
+
+        launch_path = self.get_wechat_launch_path()
+        if not launch_path or not Path(launch_path).is_file():
+            QMessageBox.warning(self, "微信路径无效", "请先在“微信启动路径”中选择微信程序或桌面快捷方式。")
+            return
+
+        try:
+            self.one_click_narrator_was_running = self.is_narrator_running()
+        except Exception as exc:
+            QMessageBox.warning(self, "讲述人状态异常", f"无法检查讲述人状态:\n{exc}")
+            return
+
+        self.one_click_run_active = True
+        self.one_click_tree_stable_count = 0
+        self.one_click_login_button_clicked = False
+        self.one_click_login_wait_deadline = 0
+        if self.one_click_run_btn is not None:
+            self.one_click_run_btn.setEnabled(False)
+            self.one_click_run_btn.setText("正在准备微信...")
+        if self.open_target_window_btn is not None:
+            self.open_target_window_btn.setEnabled(False)
+        if self.start_btn is not None:
+            self.start_btn.setEnabled(False)
+        self.set_status("one_click", "正在启动讲述人")
+        self.add_log(f"一键启动监控开始，目标联系人: {target_name}")
+        self.add_log("步骤 1/5: 启动并确认 Windows 讲述人")
+
+        self.start_narrator()
+        self.one_click_stage_deadline = time.monotonic() + 15
+        QTimer.singleShot(500, self._wait_one_click_narrator_started)
+
+    def _wait_one_click_narrator_started(self):
+        if not self.one_click_run_active:
+            return
+        try:
+            narrator_ready = self.is_narrator_running()
+        except Exception as exc:
+            self._finish_one_click_wechat(False, f"检查讲述人状态失败: {exc}")
+            return
+
+        if narrator_ready:
+            self.set_status("narrator", "已开启")
+            self.set_status("one_click", "讲述人已确认，准备启动微信")
+            self.add_log("已确认讲述人进程运行，等待 2 秒后启动微信")
+            QTimer.singleShot(2000, self._launch_one_click_wechat)
+            return
+
+        if time.monotonic() >= self.one_click_stage_deadline:
+            self._finish_one_click_wechat(False, "讲述人启动超时，已停止一键启动监控")
+            return
+        QTimer.singleShot(500, self._wait_one_click_narrator_started)
+
+    def _launch_one_click_wechat(self):
+        if not self.one_click_run_active:
+            return
+        launch_path = self.get_wechat_launch_path()
+        try:
+            os.startfile(launch_path)
+        except Exception as exc:
+            if not self.one_click_narrator_was_running:
+                self.stop_narrator()
+            self._finish_one_click_wechat(False, f"启动微信失败: {exc}")
+            return
+
+        self.set_status("one_click", "微信已启动，等待控件树")
+        self.add_log(f"已启动微信: {launch_path}")
+        self.add_log("正在确认微信 UIAutomation 控件树，讲述人将在确认完成前保持开启")
+        self.one_click_stage_deadline = time.monotonic() + 45
+        self.one_click_tree_stable_count = 0
+        QTimer.singleShot(1000, self._wait_one_click_wechat_control_tree)
+
+    def _wait_one_click_wechat_control_tree(self):
+        if not self.one_click_run_active:
+            return
+
+        ready, detail = self._is_wechat_control_tree_ready()
+        if ready:
+            self.one_click_tree_stable_count += 1
+            self.set_status("one_click", f"控件树确认 {self.one_click_tree_stable_count}/3")
+            if self.one_click_tree_stable_count >= 3:
+                self.add_log(f"{detail}，已连续确认 3 次")
+                self.set_status("one_click", "控件树已就绪，准备检查登录")
+                self.add_log("步骤 2/5: 微信控件树已稳定")
+                self.one_click_stage_deadline = time.monotonic() + 15
+                QTimer.singleShot(1000, self._prepare_login_before_closing_narrator)
+                return
+        else:
+            self.one_click_tree_stable_count = 0
+            self.set_status("one_click", detail)
+
+        if time.monotonic() >= self.one_click_stage_deadline:
+            self._finish_one_click_wechat(
+                False,
+                "45 秒内未能确认微信控件树；为避免过早关闭，讲述人将保持开启",
+            )
+            return
+        QTimer.singleShot(1000, self._wait_one_click_wechat_control_tree)
+
+    def _prepare_login_before_closing_narrator(self):
+        if not self.one_click_run_active:
+            return
+
+        process_ids = self._get_wechat_process_ids()
+        state, detail = self.wechat.get_login_state(process_ids)
+        self.set_status("one_click", detail)
+
+        if state == "login_ready":
+            self.add_log("已在讲述人开启期间找到微信登录按钮，正在点击并验证")
+            click_result = self.wechat.click_login_button(process_ids)
+            if not click_result:
+                summary = self.wechat.get_login_ui_summary(process_ids)
+                self.add_log(f"登录按钮点击失败控件摘要: {summary}")
+                self._finish_one_click_wechat(False, click_result.message)
+                return
+            self.one_click_login_button_clicked = True
+            self._begin_one_click_login_wait()
+            self.add_log(f"步骤 3/5: {click_result.message}")
+            self.set_status("one_click", "登录已触发，正在关闭讲述人")
+            QTimer.singleShot(300, self._close_one_click_narrator)
+            return
+
+        if state == "waiting_mobile":
+            self.one_click_login_button_clicked = True
+            self._begin_one_click_login_wait()
+            self.add_log("步骤 3/5: 微信已经在等待手机确认登录")
+            QTimer.singleShot(300, self._close_one_click_narrator)
+            return
+
+        if state == "logged_in":
+            self.add_log(f"步骤 3/5: {detail}")
+            QTimer.singleShot(300, self._close_one_click_narrator)
+            return
+
+        if state == "qr_required":
+            self.add_log("步骤 3/5: 已检测到微信扫码登录界面")
+            QTimer.singleShot(300, self._close_one_click_narrator)
+            return
+
+        if time.monotonic() >= self.one_click_stage_deadline:
+            summary = self.wechat.get_login_ui_summary(process_ids)
+            self.add_log(f"登录界面识别超时控件摘要: {summary}")
+            self._finish_one_click_wechat(
+                False,
+                f"15 秒内未能识别微信登录状态。{detail}",
+            )
+            return
+
+        if self.one_click_run_btn is not None:
+            self.one_click_run_btn.setText("正在识别登录按钮...")
+        QTimer.singleShot(500, self._prepare_login_before_closing_narrator)
+
+    def _close_one_click_narrator(self):
+        if not self.one_click_run_active:
+            return
+        self.set_status("one_click", "正在关闭讲述人")
+        self.add_log("微信控件树已稳定，开始关闭 Windows 讲述人")
+        self.stop_narrator()
+        self.one_click_stage_deadline = time.monotonic() + 10
+        QTimer.singleShot(500, self._wait_one_click_narrator_stopped)
+
+    def _begin_one_click_login_wait(self):
+        self.one_click_login_wait_deadline = (
+            time.monotonic() + ONE_CLICK_LOGIN_CONFIRM_TIMEOUT_SECONDS
+        )
+
+    def _wait_one_click_narrator_stopped(self):
+        if not self.one_click_run_active:
+            return
+        try:
+            narrator_running = self.is_narrator_running()
+        except Exception as exc:
+            self._finish_one_click_wechat(False, f"检查讲述人关闭状态失败: {exc}")
+            return
+
+        if not narrator_running:
+            self.set_status("narrator", "未开启")
+            self.add_log("Windows 讲述人已关闭")
+            if self.one_click_login_button_clicked:
+                self._begin_one_click_login_wait()
+            else:
+                self.one_click_stage_deadline = time.monotonic() + 15
+            QTimer.singleShot(300, self._continue_one_click_login_flow)
+            return
+        if time.monotonic() >= self.one_click_stage_deadline:
+            self.set_status("narrator", "关闭超时，流程继续")
+            self.add_log(
+                "Windows 讲述人关闭确认超时；不再中断一键启动，"
+                "继续检测微信登录并打开目标联系人"
+            )
+            if self.one_click_login_button_clicked:
+                self._begin_one_click_login_wait()
+            else:
+                self.one_click_stage_deadline = time.monotonic() + 15
+            QTimer.singleShot(300, self._continue_one_click_login_flow)
+            return
+        QTimer.singleShot(500, self._wait_one_click_narrator_stopped)
+
+    def _continue_one_click_login_flow(self):
+        if not self.one_click_run_active:
+            return
+
+        process_ids = self._get_wechat_process_ids()
+        state, detail = self.wechat.get_login_state(process_ids)
+        if state == "logged_in":
+            self.set_status("one_click", "微信已登录，正在打开目标联系人")
+            self.add_log(f"步骤 4/5: {detail}")
+            QTimer.singleShot(300, self._start_one_click_target_window)
+            return
+
+        if state == "login_ready":
+            click_result = self.wechat.click_login_button(process_ids)
+            if not click_result:
+                self._finish_one_click_wechat(False, click_result.message)
+                return
+            self.one_click_login_button_clicked = True
+            self._begin_one_click_login_wait()
+            self.add_log(f"步骤 4/5: {click_result.message}")
+            self.add_log("登录请求已发出，持续等待手机微信确认")
+            self._wait_one_click_login()
+            return
+
+        if state == "waiting_mobile":
+            if not self.one_click_login_button_clicked:
+                self.add_log("检测到微信正在等待手机确认登录")
+                self.one_click_login_button_clicked = True
+            self._begin_one_click_login_wait()
+            self._wait_one_click_login()
+            return
+
+        if state == "qr_required":
+            self._finish_one_click_wechat(
+                False,
+                "检测到微信当前需要扫码登录。请先使用手机微信扫描二维码，登录完成后再次点击“一键启动监控”。",
+                attention=True,
+            )
+            return
+
+        if self.one_click_login_button_clicked:
+            self._wait_one_click_login()
+            return
+
+        if time.monotonic() >= self.one_click_stage_deadline:
+            summary = self.wechat.get_login_ui_summary(process_ids)
+            self.add_log(f"未识别登录界面控件摘要: {summary}")
+            self._finish_one_click_wechat(
+                False,
+                f"15 秒内未能识别微信登录状态。{detail}\n请查看日志中的控件摘要。",
+            )
+            return
+
+        self.set_status("one_click", detail)
+        if self.one_click_run_btn is not None:
+            self.one_click_run_btn.setText("正在识别登录状态...")
+        QTimer.singleShot(1000, self._continue_one_click_login_flow)
+
+    def _wait_one_click_login(self):
+        if not self.one_click_run_active:
+            return
+
+        if not self.one_click_login_wait_deadline:
+            self._begin_one_click_login_wait()
+
+        process_ids = self._get_wechat_process_ids()
+        state, detail = self.wechat.get_login_state(process_ids)
+        if state == "logged_in":
+            self.set_status("one_click", "登录成功，正在打开目标联系人")
+            self.add_log(f"已检测到登录完成: {detail}")
+            QTimer.singleShot(500, self._start_one_click_target_window)
+            return
+        if state == "qr_required":
+            self._finish_one_click_wechat(
+                False,
+                "微信已切换到扫码登录。请使用手机微信扫描二维码，登录完成后再次点击“一键启动监控”。",
+                attention=True,
+            )
+            return
+
+        if state == "login_ready":
+            click_result = self.wechat.click_login_button(process_ids)
+            if not click_result:
+                self._finish_one_click_wechat(False, click_result.message)
+                return
+            self.one_click_login_button_clicked = True
+            self._begin_one_click_login_wait()
+            self.add_log(f"微信重新显示登录按钮，已再次触发: {click_result.message}")
+
+        if time.monotonic() >= self.one_click_login_wait_deadline:
+            summary = self.wechat.get_login_ui_summary(process_ids)
+            self.add_log(f"等待手机确认登录超时控件摘要: {summary}")
+            self._finish_one_click_wechat(
+                False,
+                (
+                    f"{ONE_CLICK_LOGIN_CONFIRM_TIMEOUT_SECONDS} 秒内未检测到微信登录完成。"
+                    f"{detail}\n如果手机已确认，请确认微信主界面已经显示后再次点击“一键启动监控”。"
+                ),
+            )
+            return
+
+        status_text = "等待手机确认登录"
+        if state not in {"waiting_mobile", "login_ready", "starting"}:
+            status_text = f"等待登录完成: {detail}"
+        self.set_status("one_click", status_text)
+        if self.one_click_run_btn is not None:
+            self.one_click_run_btn.setText("等待手机确认")
+        QTimer.singleShot(1000, self._wait_one_click_login)
+
+    def _start_one_click_target_window(self):
+        if not self.one_click_run_active:
+            return
+
+        target_name = self.config.get("settings", {}).get("trigger_sender", "").strip()
+        if not target_name:
+            self._finish_one_click_wechat(False, "目标联系人名称为空")
+            return
+
+        self.set_status("one_click", f"正在打开并置顶: {target_name}")
+        if self.one_click_run_btn is not None:
+            self.one_click_run_btn.setText("正在打开目标窗口...")
+        self.add_log(f"正在搜索联系人并打开独立窗口: {target_name}")
+        threading.Thread(
+            target=self._one_click_target_window_worker,
+            args=(target_name,),
+            daemon=True,
+        ).start()
+
+    def _one_click_target_window_worker(self, target_name):
+        _uia_init = auto.UIAutomationInitializerInThread()
+        try:
+            result = self.wechat.open_independent_chat_window(target_name)
+            self.one_click_target_finished_signal.emit(bool(result), result.message)
+        except Exception as exc:
+            self.one_click_target_finished_signal.emit(
+                False,
+                f"打开目标聊天窗口异常: {exc}",
+            )
+        finally:
+            _uia_init = None
+
+    def _finish_one_click_target_window(self, success, message):
+        if not self.one_click_run_active:
+            return
+        self.set_status("target", message)
+        self.add_log(message)
+        if not success:
+            self._finish_one_click_wechat(False, message)
+            return
+
+        self.add_log("步骤 5/5: 目标独立窗口已打开并置顶，正在启动监控")
+        if not self.start_monitoring(silent=True):
+            self._finish_one_click_wechat(
+                False,
+                "目标窗口已打开，但启动消息监控失败，请查看日志。",
+            )
+            return
+        self._finish_one_click_wechat(
+            True,
+            "微信已登录，目标独立窗口已打开并置顶，关键词监控已启动。",
+        )
+
+    def _finish_one_click_wechat(self, success, message, attention=False):
+        self.one_click_run_active = False
+        if self.one_click_run_btn is not None:
+            self.one_click_run_btn.setEnabled(True)
+            self.one_click_run_btn.setText("一键启动监控")
+        if self.open_target_window_btn is not None:
+            self.open_target_window_btn.setEnabled(True)
+        if self.start_btn is not None:
+            self.start_btn.setEnabled(not self.monitoring)
+        self.set_status(
+            "one_click",
+            "监控已启动" if success else ("需要扫码" if attention else "未完成"),
+        )
+        self.add_log(f"一键启动监控{'完成' if success else '未完成'}: {message}")
+        if not success:
+            if attention:
+                QMessageBox.information(self, "需要扫码登录", message)
+            else:
+                QMessageBox.warning(self, "一键启动监控未完成", message)
 
     def _get_current_session_identifier(self):
         query_exe = self._get_windows_system_tool("query.exe")
@@ -1935,6 +3308,13 @@ class MomoReplyGUI(QWidget):
                 color: #172033;
                 font-weight: 500;
             }
+            QLabel#scheduleCalculation {
+                color: #344054;
+                background: #f8fafc;
+                border: 1px solid #e4eaf2;
+                border-radius: 8px;
+                padding: 12px;
+            }
             QScrollArea {
                 border: none;
                 background: transparent;
@@ -1965,6 +3345,18 @@ class MomoReplyGUI(QWidget):
             screen_rect.y() + max(0, (screen_rect.height() - initial_height) // 2),
         )
 
+    def bring_main_window_to_front(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+        if os.name == "nt":
+            try:
+                hwnd = int(self.winId())
+                ctypes.windll.user32.ShowWindow(hwnd, 9)
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+
     def initUI(self):
         self.setObjectName("root")
         self.apply_app_style()
@@ -1990,6 +3382,18 @@ class MomoReplyGUI(QWidget):
         check_btn = QPushButton("立即自检")
         check_btn.setObjectName("secondaryButton")
         check_btn.clicked.connect(self.run_startup_check)
+
+        self.one_click_run_btn = QPushButton("一键启动监控")
+        self.one_click_run_btn.setObjectName("primaryButton")
+        self.one_click_run_btn.setToolTip(
+            "自动准备微信控件树、完成登录检测、打开并置顶目标窗口，然后启动关键词监控"
+        )
+        self.one_click_run_btn.clicked.connect(self.start_one_click_wechat)
+
+        self.open_target_window_btn = QPushButton("打开并置顶目标窗口")
+        self.open_target_window_btn.setObjectName("secondaryButton")
+        self.open_target_window_btn.setToolTip("搜索目标联系人，打开独立聊天窗口并设置置顶")
+        self.open_target_window_btn.clicked.connect(self.open_target_chat_window)
 
         narrator_buttons = QWidget()
         narrator_layout = QHBoxLayout(narrator_buttons)
@@ -2024,6 +3428,8 @@ class MomoReplyGUI(QWidget):
         disconnect_btn.clicked.connect(self.disconnect_remote_session)
 
         action_layout.addWidget(check_btn)
+        action_layout.addWidget(self.one_click_run_btn)
+        action_layout.addWidget(self.open_target_window_btn)
         action_layout.addWidget(narrator_buttons)
         action_layout.addWidget(self.start_btn)
         action_layout.addWidget(self.stop_btn)
@@ -2046,6 +3452,7 @@ class MomoReplyGUI(QWidget):
         config_layout.addWidget(self.init_language_choose())
         config_layout.addLayout(self.init_settings())
         config_layout.addLayout(self.init_keyword_timing_settings())
+        config_layout.addWidget(self.init_remote_control_settings())
         config_layout.addStretch()
         config_scroll.setWidget(config_inner)
         tabs.addTab(config_scroll, "关键词触发回复")
@@ -2073,8 +3480,9 @@ class MomoReplyGUI(QWidget):
 
         self.setLayout(outer_layout)
         self.apply_initial_window_geometry()
-        self.setWindowTitle("微信自动回复助手")
+        self.setWindowTitle(APP_WINDOW_TITLE)
         self.show()
+        QTimer.singleShot(100, self.bring_main_window_to_front)
 
 
 def configure_high_dpi():
@@ -2089,6 +3497,7 @@ def configure_high_dpi():
 
 
 if __name__ == "__main__":
+    sys.excepthook = report_unhandled_exception
     configure_high_dpi()
     app = QApplication(sys.argv)
     ex = MomoReplyGUI()
